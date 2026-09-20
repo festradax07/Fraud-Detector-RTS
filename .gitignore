@@ -1,0 +1,8 @@
+/server
+/settlement
+/loadgen
+*.exe
+
+# Documentos privados
+/docs/
+/CLAUDE.md

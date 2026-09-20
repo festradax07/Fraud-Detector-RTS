@@ -1,0 +1,53 @@
+syntax = "proto3";
+package transactions;
+option go_package = "fd_rts/proto/transactions_pb";
+
+service FraudEngine {
+  rpc EvaluateTransaction (TransactionRequest) returns (EvaluationResponse);
+}
+service Settlement {
+  rpc CommitTransaction (SettlementRequest) returns (SettlementResponse);
+}
+
+message TransactionRequest {
+  string tx_id = 1;
+  string user_id = 2;
+  string card_token = 3;
+  double amount = 4;
+  string merchant_category = 5;
+  double latitude = 6;
+  double longitude = 7;
+  int64 emission_timestamp_ns = 8;
+  int32 deadline_budget_ms = 9;
+}
+
+message EvaluationResponse {
+  string tx_id = 1;
+  bool is_fraud = 2;
+  string rejection_reason = 3;
+  double risk_score = 4;
+  bool is_degraded = 5;
+  int64 processing_time_ms = 6;
+}
+
+enum TxStatus {
+  STATUS_UNKNOWN = 0;
+  STATUS_COMMITTED = 1;
+  STATUS_REJECTED_FRAUD = 2;
+  STATUS_ABORTED_TIMEOUT = 3;
+}
+
+message SettlementRequest {
+  string tx_id = 1;
+  string user_id = 2;
+  double amount = 3;
+  EvaluationResponse evaluation = 4;
+  int64 emission_timestamp_ns = 5;
+}
+
+message SettlementResponse {
+  string tx_id = 1;
+  TxStatus status = 2;
+  int64 end_to_end_latency_ms = 3;
+  string message = 4;
+}
