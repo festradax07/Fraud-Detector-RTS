@@ -16,7 +16,17 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"fd_rts/internal/mandatoria"
 	pb "fd_rts/proto"
+)
+
+// Motivos de rechazo por fraude (campo rejection_reason). Son códigos fijos
+// para que el cliente y Settlement puedan decidir según el motivo; el
+// detalle (cuántos intentos, cuántos km/h) va al log.
+const (
+	motivoBlacklist      = "BLACKLIST"
+	motivoCardTesting    = "CARD_TESTING"
+	motivoViajeImposible = "VIAJE_IMPOSIBLE"
 )
 
 // minBudget es el tiempo mínimo que tiene que quedar para que valga la pena
@@ -27,6 +37,7 @@ const minBudget = 35 * time.Millisecond
 
 type fraudEngineServer struct {
 	pb.UnimplementedFraudEngineServer
+	verificador *mandatoria.Verificador
 }
 
 func (s *fraudEngineServer) EvaluateTransaction(ctx context.Context, req *pb.TransactionRequest) (*pb.EvaluationResponse, error) {
@@ -52,14 +63,62 @@ func (s *fraudEngineServer) EvaluateTransaction(ctx context.Context, req *pb.Tra
 			"deadline insuficiente: quedan %v, se necesitan al menos %v", remaining, minBudget)
 	}
 
-	// TODO(paso 2): fase mandatoria — blacklist, velocidad (Redis ZSET),
-	// viaje imposible.
-	//
-	// TODO(paso 3): slack time — decidir si corre la fase opcional.
-	//
-	// TODO(paso 4): fase opcional — scoring de riesgo.
+	// Validación de la request: sin tarjeta o sin coordenadas no hay con qué
+	// evaluar. Es un error del cliente (InvalidArgument), no un fraude.
+	if req.CardToken == "" {
+		return nil, status.Error(codes.InvalidArgument, "falta card_token")
+	}
+	if !mandatoria.CoordenadasValidas(req.Latitude, req.Longitude) {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"coordenadas inválidas o ausentes: (%v, %v)", req.Latitude, req.Longitude)
+	}
 
-	log.Printf("tx_id=%s user_id=%s amount=%.2f -> stub OK", req.TxId, req.UserId, req.Amount)
+	// rechazar arma la respuesta de fraude. Un fraude NO es un error gRPC:
+	// el motor funcionó bien y decidió "no", así que va con código OK y el
+	// motivo en el cuerpo. Es una closure: ve req y start de esta función.
+	rechazar := func(motivo string) *pb.EvaluationResponse {
+		return &pb.EvaluationResponse{
+			TxId:             req.TxId,
+			IsFraud:          true,
+			RejectionReason:  motivo,
+			ProcessingTimeMs: time.Since(start).Milliseconds(),
+		}
+	}
+
+	// --- Fase mandatoria (M_i) ---
+	v := s.verificador
+	ahora := start
+
+	// Se registra ANTES de cualquier rechazo: el control de velocidad cuenta
+	// todos los intentos, también los que después se rechazan.
+	intentos := v.RegistrarIntento(req.CardToken, ahora)
+
+	// 1. Blacklist: el más barato, va primero.
+	if v.EnBlacklist(req.CardToken) {
+		log.Printf("tx_id=%s FRAUDE %s", req.TxId, motivoBlacklist)
+		return rechazar(motivoBlacklist), nil
+	}
+
+	// 2. Control de velocidad (card testing).
+	if intentos > mandatoria.MaxIntentos {
+		log.Printf("tx_id=%s FRAUDE %s: %d intentos en %v", req.TxId, motivoCardTesting, intentos, mandatoria.VentanaVelocidad)
+		return rechazar(motivoCardTesting), nil
+	}
+
+	// 3. Viaje imposible.
+	kmh, hayPrevia := v.VelocidadDesdeUltima(req.CardToken, req.Latitude, req.Longitude, ahora)
+	if hayPrevia && kmh > mandatoria.VelocidadMaxKmh {
+		log.Printf("tx_id=%s FRAUDE %s: %.0f km/h", req.TxId, motivoViajeImposible, kmh)
+		return rechazar(motivoViajeImposible), nil
+	}
+
+	// Aprobada: recién ahora esta posición pasa a ser confiable.
+	v.ActualizarPosicion(req.CardToken, req.Latitude, req.Longitude, ahora)
+
+	// TODO(etapa 4): slack time — decidir si corre la fase opcional
+	// (scoring de riesgo). Hasta entonces, la respuesta es solo M_i.
+
+	log.Printf("tx_id=%s card=%s amount=%.2f -> APROBADA", req.TxId, req.CardToken, req.Amount)
 
 	return &pb.EvaluationResponse{
 		TxId:             req.TxId,
@@ -79,9 +138,12 @@ func main() {
 	}
 
 	grpcServer := grpc.NewServer()
-	pb.RegisterFraudEngineServer(grpcServer, &fraudEngineServer{})
+	// Blacklist de ejemplo, fija en el código. En la Etapa 3 pasa a ser un
+	// SET en Redis.
+	verificador := mandatoria.NuevoVerificador([]string{"tok-robada"})
+	pb.RegisterFraudEngineServer(grpcServer, &fraudEngineServer{verificador: verificador})
 
-	log.Printf("fraud-engine (esqueleto) escuchando en %s", addr)
+	log.Printf("fraud-engine escuchando en %s", addr)
 	if err := grpcServer.Serve(lis); err != nil {
 		log.Fatalf("error sirviendo: %v", err)
 	}
