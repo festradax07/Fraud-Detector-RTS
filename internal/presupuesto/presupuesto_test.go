@@ -67,7 +67,7 @@ func TestCoherenciaDelDiseno(t *testing.T) {
 	// Lo peor que puede tardar una transacción completa tiene que entrar en
 	// el deadline global de 200ms.
 	peorCaso := WCETMandatoria + WCETOpcional + ReservaSettleNet
-	if peorCaso > 200*ms {
-		t.Errorf("M + O + settle + net = %v, no entra en 200ms", peorCaso)
+	if peorCaso > DeadlineGlobal {
+		t.Errorf("M + O + settle + net = %v, no entra en %v", peorCaso, DeadlineGlobal)
 	}
 }

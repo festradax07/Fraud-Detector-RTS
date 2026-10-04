@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"fd_rts/internal/redisclient"
 )
 
 // ---------------------------------------------------------------------------
@@ -26,7 +28,7 @@ const redisAddrTest = "localhost:6379"
 // se ve como "ok" y esconde que falta la infraestructura.
 func verificadorDePrueba(t *testing.T) *Verificador {
 	t.Helper()
-	rdb := NuevoClienteRedis(redisAddrTest)
+	rdb := redisclient.Nuevo(redisAddrTest)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -295,7 +297,7 @@ func TestEstadisticasEnElViaje1(t *testing.T) {
 
 func TestRedisCaido(t *testing.T) {
 	// Puerto donde no hay nadie escuchando: simula Redis caído.
-	rdb := NuevoClienteRedis("localhost:1")
+	rdb := redisclient.Nuevo("localhost:1")
 	defer rdb.Close()
 	v := NuevoVerificador(rdb, "test:")
 

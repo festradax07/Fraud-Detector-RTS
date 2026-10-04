@@ -11,6 +11,11 @@ package presupuesto
 import "time"
 
 const (
+	// DeadlineGlobal es el deadline duro de extremo a extremo de cada
+	// transacción: D_i = a_i + 200ms. Una respuesta correcta que llega
+	// después cuenta como falla.
+	DeadlineGlobal = 200 * time.Millisecond
+
 	// WCETMandatoria es el peor tiempo de ejecución presupuestado para la
 	// fase mandatoria (M_i).
 	WCETMandatoria = 20 * time.Millisecond

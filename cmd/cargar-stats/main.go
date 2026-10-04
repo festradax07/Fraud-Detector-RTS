@@ -28,6 +28,7 @@ import (
 
 	"fd_rts/internal/mandatoria"
 	"fd_rts/internal/opcional"
+	"fd_rts/internal/redisclient"
 )
 
 // acumulador lleva media y varianza de ln(monto) en una sola pasada, sin
@@ -84,7 +85,7 @@ func main() {
 	}
 	sort.Strings(categorias)
 
-	rdb := mandatoria.NuevoClienteRedis(*redisAddr)
+	rdb := redisclient.Nuevo(*redisAddr)
 	defer rdb.Close()
 	v := mandatoria.NuevoVerificador(rdb, *prefijo)
 

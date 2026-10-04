@@ -9,15 +9,20 @@ import (
 	"errors"
 	"log"
 	"net"
+	"strconv"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	"fd_rts/internal/mandatoria"
 	"fd_rts/internal/opcional"
 	"fd_rts/internal/presupuesto"
+	"fd_rts/internal/redisclient"
+	"fd_rts/internal/settlement"
 	pb "fd_rts/proto"
 )
 
@@ -42,9 +47,16 @@ const iteracionesScoring = 10_000_000
 // entorno (REDIS_ADDR).
 const redisAddr = "localhost:6379"
 
+// settlementAddr: dónde escucha Settlement (Etapa 5). Mismo criterio que
+// redisAddr: pasa a variable de entorno en la Etapa 7.5.
+const settlementAddr = "localhost:50052"
+
 type fraudEngineServer struct {
 	pb.UnimplementedFraudEngineServer
 	verificador *mandatoria.Verificador
+	// settle es el cliente gRPC de Settlement: desde la Etapa 5 el
+	// Fraud-Engine es servidor (de los clientes) Y cliente (de Settlement).
+	settle pb.SettlementClient
 }
 
 func (s *fraudEngineServer) EvaluateTransaction(ctx context.Context, req *pb.TransactionRequest) (*pb.EvaluationResponse, error) {
@@ -95,16 +107,17 @@ func (s *fraudEngineServer) EvaluateTransaction(ctx context.Context, req *pb.Tra
 		return nil, status.Error(codes.InvalidArgument, "falta merchant_category")
 	}
 
-	// rechazar arma la respuesta de fraude. Un fraude NO es un error gRPC:
-	// el motor funcionó bien y decidió "no", así que va con código OK y el
-	// motivo en el cuerpo. Es una closure: ve req y start de esta función.
-	rechazar := func(motivo string) *pb.EvaluationResponse {
-		return &pb.EvaluationResponse{
-			TxId:             req.TxId,
-			IsFraud:          true,
-			RejectionReason:  motivo,
-			ProcessingTimeMs: time.Since(start).Milliseconds(),
-		}
+	// rechazar arma la respuesta de fraude y la manda a Settlement. Un
+	// fraude NO es un error gRPC: el motor funcionó bien y decidió "no", así
+	// que va con código OK y el motivo en el cuerpo. Es una closure: ve ctx,
+	// req y start de esta función.
+	rechazar := func(motivo string, score float64) (*pb.EvaluationResponse, error) {
+		return s.liquidar(ctx, req, &pb.EvaluationResponse{
+			TxId:            req.TxId,
+			IsFraud:         true,
+			RejectionReason: motivo,
+			RiskScore:       score,
+		}, start)
 	}
 
 	// --- Fase mandatoria (M_i) ---
@@ -139,19 +152,19 @@ func (s *fraudEngineServer) EvaluateTransaction(ctx context.Context, req *pb.Tra
 	// 1. Blacklist.
 	if res.EnBlacklist {
 		log.Printf("tx_id=%s FRAUDE %s", req.TxId, motivoBlacklist)
-		return rechazar(motivoBlacklist), nil
+		return rechazar(motivoBlacklist, 0)
 	}
 
 	// 2. Control de velocidad (card testing).
 	if res.Intentos > mandatoria.MaxIntentos {
 		log.Printf("tx_id=%s FRAUDE %s: %d intentos en %v", req.TxId, motivoCardTesting, res.Intentos, mandatoria.VentanaVelocidad)
-		return rechazar(motivoCardTesting), nil
+		return rechazar(motivoCardTesting, 0)
 	}
 
 	// 3. Viaje imposible.
 	if res.HayPrevia && res.Kmh > mandatoria.VelocidadMaxKmh {
 		log.Printf("tx_id=%s FRAUDE %s: %.0f km/h", req.TxId, motivoViajeImposible, res.Kmh)
-		return rechazar(motivoViajeImposible), nil
+		return rechazar(motivoViajeImposible, 0)
 	}
 
 	// --- Fase opcional (O_i) ---
@@ -169,32 +182,136 @@ func (s *fraudEngineServer) EvaluateTransaction(ctx context.Context, req *pb.Tra
 		riskScore = opcional.Puntuar(req.Amount, stats, iteracionesScoring)
 		if riskScore > opcional.UmbralRechazo {
 			log.Printf("tx_id=%s FRAUDE %s: score %.3f", req.TxId, motivoRiesgoAlto, riskScore)
-			resp := rechazar(motivoRiesgoAlto)
-			resp.RiskScore = riskScore
-			return resp, nil
+			return rechazar(motivoRiesgoAlto, riskScore)
 		}
 	}
 
-	// Aprobada: recién ahora esta posición pasa a ser confiable (viaje 2 a
-	// Redis, solo para aprobadas). Va DESPUÉS de la opcional: un rechazo por
+	// Pasó todos los chequeos: recién ahora esta posición pasa a ser
+	// confiable (viaje 2 a Redis). Va DESPUÉS de la opcional: un rechazo por
 	// riesgo tampoco puede mover la tarjeta. Si no se puede guardar, no se
 	// aprueba: la próxima transacción de esta tarjeta se compararía contra
 	// una posición vieja y el chequeo de viaje imposible quedaría debilitado.
+	//
+	// Va ANTES de Settlement: la posición ya es confiable (pasó los
+	// chequeos de fraude) aunque Settlement falle por infraestructura. Al
+	// revés sería peor: Settlement comprometería la transacción y, si
+	// después fallara este SET, le diríamos "error" al cliente sobre una
+	// transacción ya comprometida.
 	if err := v.ActualizarPosicion(ctx, req.CardToken, req.Latitude, req.Longitude, ahora); err != nil {
 		return nil, fallaDeVerificacion(req.TxId, err)
 	}
 
-	log.Printf("tx_id=%s card=%s amount=%.2f score=%.3f degradada=%v -> APROBADA",
+	log.Printf("tx_id=%s card=%s amount=%.2f score=%.3f degradada=%v -> APROBADA por el motor",
 		req.TxId, req.CardToken, req.Amount, riskScore, degradada)
 
-	return &pb.EvaluationResponse{
-		TxId:             req.TxId,
-		IsFraud:          false,
-		RejectionReason:  "",
-		RiskScore:        riskScore,
-		IsDegraded:       degradada,
-		ProcessingTimeMs: time.Since(start).Milliseconds(),
-	}, nil
+	return s.liquidar(ctx, req, &pb.EvaluationResponse{
+		TxId:       req.TxId,
+		IsFraud:    false,
+		RiskScore:  riskScore,
+		IsDegraded: degradada,
+	}, start)
+}
+
+// liquidar manda la decisión a Settlement y arma la respuesta final.
+//
+// La llamada tiene su propio timeout: ReservaSettleNet (C_settle + C_net),
+// lo que el slack ya le reserva. context.WithTimeout NUNCA alarga el
+// deadline: si al ctx de la request le queda menos, gana el que vence
+// primero. Así no nos quedamos esperando si Settlement se cuelga, y el
+// deadline del cliente se sigue respetando.
+//
+// Política ante una falla de Settlement:
+//   - Aprobada: fail-closed. Sin commit confirmado no se responde "aprobada":
+//     error gRPC.
+//   - Rechazada: la decisión de rechazar ya es la segura. Se responde igual
+//     el rechazo y se deja en el log que se perdió el registro de auditoría.
+func (s *fraudEngineServer) liquidar(ctx context.Context, req *pb.TransactionRequest, eval *pb.EvaluationResponse, start time.Time) (*pb.EvaluationResponse, error) {
+	ctxSettle, cancel := context.WithTimeout(ctx, presupuesto.ReservaSettleNet)
+	defer cancel()
+
+	var trailer metadata.MD
+	t0 := time.Now()
+	sr, err := s.settle.CommitTransaction(ctxSettle, &pb.SettlementRequest{
+		TxId:                req.TxId,
+		UserId:              req.UserId,
+		Amount:              req.Amount,
+		Evaluation:          eval,
+		EmissionTimestampNs: req.EmissionTimestampNs,
+	}, grpc.Trailer(&trailer))
+	total := time.Since(t0)
+
+	// Medición de C_settle y C_net (ver internal/settlement).
+	if cSettle, ok := leerCSettle(trailer); ok {
+		log.Printf("tx_id=%s settlement: total=%v c_settle=%v c_net=%v", req.TxId, total, cSettle, total-cSettle)
+	} else {
+		log.Printf("tx_id=%s settlement: total=%v (sin trailer)", req.TxId, total)
+	}
+
+	eval.ProcessingTimeMs = time.Since(start).Milliseconds()
+
+	if err != nil {
+		if eval.IsFraud {
+			log.Printf("tx_id=%s REGISTRO PERDIDO (rechazo respondido igual): %v", req.TxId, err)
+			return eval, nil
+		}
+		return nil, fallaDeSettlement(req.TxId, err)
+	}
+
+	// Manda lo REGISTRADO, no la evaluación de este intento: en un reintento
+	// (mismo tx_id) Settlement devuelve el primer resultado final, que puede
+	// diferir si algo cambió entre medio (por ejemplo, la tarjeta entró en
+	// la blacklist). Si la plata ya se comprometió, decirle "fraude" al
+	// cliente sería mentirle.
+	switch sr.Status {
+	case pb.TxStatus_STATUS_COMMITTED:
+		if eval.IsFraud {
+			log.Printf("tx_id=%s REINTENTO: ya estaba COMPROMETIDA (esta evaluación daba %s)", req.TxId, eval.RejectionReason)
+			eval.IsFraud, eval.RejectionReason = false, ""
+		}
+		log.Printf("tx_id=%s COMPROMETIDA latencia_e2e=%dms", req.TxId, sr.EndToEndLatencyMs)
+		return eval, nil
+	case pb.TxStatus_STATUS_REJECTED_FRAUD:
+		if !eval.IsFraud {
+			log.Printf("tx_id=%s REINTENTO: ya estaba RECHAZADA por %s", req.TxId, sr.Message)
+			eval.IsFraud, eval.RejectionReason = true, sr.Message
+		}
+		return eval, nil
+	case pb.TxStatus_STATUS_ABORTED_TIMEOUT:
+		// Settlement vio que se pasó el deadline global: no comprometió.
+		log.Printf("tx_id=%s ABORTADA por Settlement: latencia_e2e=%dms", req.TxId, sr.EndToEndLatencyMs)
+		if eval.IsFraud {
+			return eval, nil // el rechazo vale igual
+		}
+		return nil, status.Error(codes.DeadlineExceeded, "la transacción superó el deadline global y no se comprometió")
+	default:
+		return nil, status.Errorf(codes.Internal, "estado inesperado de Settlement: %v", sr.Status)
+	}
+}
+
+// leerCSettle saca C_settle del trailer de Settlement. ok es false si no
+// vino (por ejemplo, si la llamada ni siquiera llegó a Settlement).
+func leerCSettle(trailer metadata.MD) (time.Duration, bool) {
+	v := trailer.Get(settlement.TrailerSettleUs)
+	if len(v) != 1 {
+		return 0, false
+	}
+	us, err := strconv.ParseInt(v[0], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return time.Duration(us) * time.Microsecond, true
+}
+
+// fallaDeSettlement traduce el error de la llamada a Settlement. Ojo: un
+// error de una llamada gRPC es un *status*, no el error de context
+// original, así que errors.Is(err, context.DeadlineExceeded) NO funciona:
+// hay que mirar status.Code(err).
+func fallaDeSettlement(txID string, err error) error {
+	log.Printf("tx_id=%s SIN COMMIT: %v", txID, err)
+	if status.Code(err) == codes.DeadlineExceeded {
+		return status.Error(codes.DeadlineExceeded, "se agotó el tiempo esperando a Settlement")
+	}
+	return status.Error(codes.Unavailable, "no se pudo comprometer la transacción")
 }
 
 // fallaDeVerificacion traduce un error de Redis a un código gRPC. En los
@@ -212,8 +329,8 @@ func fallaDeVerificacion(txID string, err error) error {
 
 func main() {
 	// Cliente de Redis (configuración del hot path: respeta el deadline del
-	// ctx y no reintenta; ver mandatoria.NuevoClienteRedis).
-	rdb := mandatoria.NuevoClienteRedis(redisAddr)
+	// ctx y no reintenta; ver redisclient.Nuevo).
+	rdb := redisclient.Nuevo(redisAddr)
 	defer rdb.Close()
 
 	// PING al arrancar: si Redis no está, el server no arranca. Fail-closed
@@ -236,11 +353,25 @@ func main() {
 		log.Fatalf("no pude escuchar en %s: %v", addr, err)
 	}
 
+	// Cliente de Settlement. NewClient no conecta todavía; Connect() arranca
+	// la conexión en segundo plano para que la primera transacción no pague
+	// el costo de conectar (cold start). Si Settlement no está, no impide
+	// arrancar: cada transacción que lo necesite falla rápido (fail-closed).
+	connSettle, err := grpc.NewClient(settlementAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Fatalf("cliente de Settlement: %v", err)
+	}
+	defer connSettle.Close()
+	connSettle.Connect()
+
 	grpcServer := grpc.NewServer()
 	// La blacklist ya no está en el código: es el SET drts:blacklist en
 	// Redis (se carga con SADD, ver docs/GUIA-GO.md).
 	verificador := mandatoria.NuevoVerificador(rdb, "drts:")
-	pb.RegisterFraudEngineServer(grpcServer, &fraudEngineServer{verificador: verificador})
+	pb.RegisterFraudEngineServer(grpcServer, &fraudEngineServer{
+		verificador: verificador,
+		settle:      pb.NewSettlementClient(connSettle),
+	})
 
 	log.Printf("fraud-engine escuchando en %s", addr)
 	if err := grpcServer.Serve(lis); err != nil {
