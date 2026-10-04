@@ -1,10 +1,21 @@
-.PHONY: build run-server cargar-stats proto clean
+.PHONY: build run-server run-settlement cargar-stats carga-nominal carga-sobrecarga proto clean
 
 build:
 	go build ./...
 
 run-server:
 	go run ./cmd/server
+
+run-settlement:
+	go run ./cmd/settlement
+
+# Load-generator (Etapa 6). Requieren Redis, Settlement y el Fraud-Engine
+# corriendo, y las estadísticas cargadas.
+carga-nominal:
+	go run ./cmd/loadgen -modo nominal
+
+carga-sobrecarga:
+	go run ./cmd/loadgen -modo sobrecarga
 
 # Estadísticas por categoría para el Z-score (fase opcional). Requiere el
 # dataset en data/ y Redis levantado.

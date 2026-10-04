@@ -9,3 +9,6 @@
 
 # Datasets (pesados, se bajan aparte)
 /data/
+
+# Resultados de corridas del load-generator
+/resultados/

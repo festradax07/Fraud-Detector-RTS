@@ -90,36 +90,56 @@ func (e *entorno) commit(t *testing.T, req *pb.SettlementRequest) (*pb.Settlemen
 	return resp, trailer, err
 }
 
-func reqSettle(txID string, fraude bool, emision time.Time) *pb.SettlementRequest {
+// sinEmision: la request no trae emission_timestamp_ns.
+const sinEmision = time.Duration(-1)
+
+// reqSettle arma una request emitida hace "hace" (o sin emisión). La hora se
+// toma AL LLAMAR: en una tabla de casos hay que llamarla dentro del subtest,
+// no al armar la tabla (ver intento).
+func reqSettle(txID string, fraude bool, hace time.Duration) *pb.SettlementRequest {
 	r := &pb.SettlementRequest{
 		TxId:       txID,
 		UserId:     "u1",
 		Amount:     100,
 		Evaluation: &pb.EvaluationResponse{TxId: txID, IsFraud: fraude},
 	}
-	if !emision.IsZero() {
-		r.EmissionTimestampNs = emision.UnixNano()
+	if hace != sinEmision {
+		r.EmissionTimestampNs = time.Now().Add(-hace).UnixNano()
 	}
 	return r
 }
+
+// intento describe una request en una tabla de casos SIN armarla todavía.
+//
+// Trampa (encontrada por un test intermitente): la tabla se evalúa UNA vez,
+// antes de correr los subtests. Con time.Now() adentro de la tabla, todos
+// los casos capturan la hora de construcción; los últimos corren cientos de
+// ms después (con -race y los paquetes en paralelo) y su "ahora" ya tiene más
+// de 200ms: Settlement los aborta, con razón. La hora se toma en el subtest.
+type intento struct {
+	fraude bool
+	hace   time.Duration
+}
+
+func (i intento) req(txID string) *pb.SettlementRequest { return reqSettle(txID, i.fraude, i.hace) }
 
 func TestCommitTransaction(t *testing.T) {
 	redisDisponible(t)
 	casos := []struct {
 		nombre     string
-		req        *pb.SettlementRequest
+		req        intento
 		wantEstado pb.TxStatus
 	}{
-		{"aprobada: se compromete", reqSettle("t1", false, time.Now()), pb.TxStatus_STATUS_COMMITTED},
-		{"fraude: se registra el rechazo", reqSettle("t1", true, time.Now()), pb.TxStatus_STATUS_REJECTED_FRAUD},
+		{"aprobada: se compromete", intento{false, 0}, pb.TxStatus_STATUS_COMMITTED},
+		{"fraude: se registra el rechazo", intento{true, 0}, pb.TxStatus_STATUS_REJECTED_FRAUD},
 		// Emitida hace 300ms: ya se pasó el deadline global de 200ms.
-		{"llegó tarde: se aborta, no se compromete", reqSettle("t1", false, time.Now().Add(-300*time.Millisecond)), pb.TxStatus_STATUS_ABORTED_TIMEOUT},
-		{"sin emission_timestamp: se compromete sin medir latencia", reqSettle("t1", false, time.Time{}), pb.TxStatus_STATUS_COMMITTED},
+		{"llegó tarde: se aborta, no se compromete", intento{false, 300 * time.Millisecond}, pb.TxStatus_STATUS_ABORTED_TIMEOUT},
+		{"sin emission_timestamp: se compromete sin medir latencia", intento{false, sinEmision}, pb.TxStatus_STATUS_COMMITTED},
 	}
 	for _, c := range casos {
 		t.Run(c.nombre, func(t *testing.T) {
 			e := levantarSettlement(t, redisAddr)
-			resp, trailer, err := e.commit(t, c.req)
+			resp, trailer, err := e.commit(t, c.req.req("t1"))
 			if err != nil {
 				t.Fatalf("error inesperado: %v", err)
 			}
@@ -148,7 +168,7 @@ func TestCommitTransaction(t *testing.T) {
 func TestLatenciaExtremoAExtremo(t *testing.T) {
 	redisDisponible(t)
 	e := levantarSettlement(t, redisAddr)
-	resp, _, err := e.commit(t, reqSettle("t1", false, time.Now().Add(-50*time.Millisecond)))
+	resp, _, err := e.commit(t, reqSettle("t1", false, 50*time.Millisecond))
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
@@ -164,7 +184,7 @@ func TestIdempotencia(t *testing.T) {
 	redisDisponible(t)
 	e := levantarSettlement(t, redisAddr)
 	for i := 0; i < 3; i++ {
-		if _, _, err := e.commit(t, reqSettle("t1", false, time.Now())); err != nil {
+		if _, _, err := e.commit(t, reqSettle("t1", false, 0)); err != nil {
 			t.Fatalf("intento %d: %v", i, err)
 		}
 	}
@@ -181,7 +201,7 @@ func TestRequestInvalida(t *testing.T) {
 		nombre string
 		req    *pb.SettlementRequest
 	}{
-		{"sin tx_id", reqSettle("", false, time.Now())},
+		{"sin tx_id", reqSettle("", false, 0)},
 		{"sin evaluation", &pb.SettlementRequest{TxId: "t1"}},
 	}
 	for _, c := range casos {
@@ -202,7 +222,7 @@ func TestRequestInvalida(t *testing.T) {
 func TestRedisCaido(t *testing.T) {
 	e := levantarSettlement(t, "localhost:1")
 	inicio := time.Now()
-	_, _, err := e.commit(t, reqSettle("t1", false, time.Now()))
+	_, _, err := e.commit(t, reqSettle("t1", false, 0))
 	if status.Code(err) != codes.Unavailable {
 		t.Errorf("código = %v, se esperaba Unavailable (err=%v)", status.Code(err), err)
 	}
@@ -218,40 +238,40 @@ func TestReintentoNoPisaElResultado(t *testing.T) {
 	redisDisponible(t)
 	casos := []struct {
 		nombre     string
-		primero    *pb.SettlementRequest
-		reintento  *pb.SettlementRequest
+		primero    intento
+		reintento  intento
 		wantEstado pb.TxStatus
 	}{
 		// El caso de la ambigüedad: el motor no recibió la respuesta y el
 		// cliente reintenta con el emission_timestamp original, que ahora
 		// ya tiene más de 200ms.
 		{"commit y reintento tardío: sigue COMMITTED",
-			reqSettle("t1", false, time.Now()),
-			reqSettle("t1", false, time.Now().Add(-300*time.Millisecond)),
+			intento{false, 0},
+			intento{false, 300 * time.Millisecond},
 			pb.TxStatus_STATUS_COMMITTED},
 		// Entre el intento y el reintento la tarjeta entró en blacklist.
 		{"commit y reintento evaluado como fraude: sigue COMMITTED",
-			reqSettle("t1", false, time.Now()),
-			reqSettle("t1", true, time.Now()),
+			intento{false, 0},
+			intento{true, 0},
 			pb.TxStatus_STATUS_COMMITTED},
 		{"rechazo y reintento aprobado: sigue REJECTED_FRAUD",
-			reqSettle("t1", true, time.Now()),
-			reqSettle("t1", false, time.Now()),
+			intento{true, 0},
+			intento{false, 0},
 			pb.TxStatus_STATUS_REJECTED_FRAUD},
 		// ABORTED_TIMEOUT no es final: no se comprometió nada, así que un
 		// reintento a tiempo sí puede comprometer.
 		{"abortada y reintento a tiempo: COMMITTED",
-			reqSettle("t1", false, time.Now().Add(-300*time.Millisecond)),
-			reqSettle("t1", false, time.Now()),
+			intento{false, 300 * time.Millisecond},
+			intento{false, 0},
 			pb.TxStatus_STATUS_COMMITTED},
 	}
 	for _, c := range casos {
 		t.Run(c.nombre, func(t *testing.T) {
 			e := levantarSettlement(t, redisAddr)
-			if _, _, err := e.commit(t, c.primero); err != nil {
+			if _, _, err := e.commit(t, c.primero.req("t1")); err != nil {
 				t.Fatalf("primer intento: %v", err)
 			}
-			resp, _, err := e.commit(t, c.reintento)
+			resp, _, err := e.commit(t, c.reintento.req("t1"))
 			if err != nil {
 				t.Fatalf("reintento: %v", err)
 			}

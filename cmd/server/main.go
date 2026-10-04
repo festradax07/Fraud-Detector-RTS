@@ -7,6 +7,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"strconv"
@@ -18,6 +19,7 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	"fd_rts/internal/fallas"
 	"fd_rts/internal/mandatoria"
 	"fd_rts/internal/opcional"
 	"fd_rts/internal/presupuesto"
@@ -71,15 +73,15 @@ func (s *fraudEngineServer) EvaluateTransaction(ctx context.Context, req *pb.Tra
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		log.Printf("tx_id=%s rechazada: la llamada no trae deadline", req.TxId)
-		return nil, status.Error(codes.InvalidArgument, "la llamada debe traer un deadline")
+		return nil, fallas.Nueva(codes.InvalidArgument, fallas.SinDeadline, "la llamada debe traer un deadline")
 	}
 
 	// D_rem = deadline - ahora. Si no alcanza para el trabajo mínimo, corte.
 	remaining := time.Until(deadline)
 	if !presupuesto.Admitir(remaining) {
 		log.Printf("tx_id=%s EARLY DROP: quedan %v, mínimo %v", req.TxId, remaining, presupuesto.MinParaAdmitir)
-		return nil, status.Errorf(codes.DeadlineExceeded,
-			"deadline insuficiente: quedan %v, se necesitan al menos %v", remaining, presupuesto.MinParaAdmitir)
+		return nil, fallas.Nueva(codes.DeadlineExceeded, fallas.EarlyDrop,
+			fmt.Sprintf("deadline insuficiente: quedan %v, se necesitan al menos %v", remaining, presupuesto.MinParaAdmitir))
 	}
 
 	// Validación de la request: sin tarjeta o sin coordenadas no hay con qué
@@ -88,23 +90,23 @@ func (s *fraudEngineServer) EvaluateTransaction(ctx context.Context, req *pb.Tra
 	// tx_id es obligatorio desde la Etapa 3: es el miembro del ZSET de
 	// velocidad, y vacío haría que todos esos intentos se fundieran en uno.
 	if req.TxId == "" {
-		return nil, status.Error(codes.InvalidArgument, "falta tx_id")
+		return nil, fallas.Nueva(codes.InvalidArgument, fallas.RequestInvalida, "falta tx_id")
 	}
 	if req.CardToken == "" {
-		return nil, status.Error(codes.InvalidArgument, "falta card_token")
+		return nil, fallas.Nueva(codes.InvalidArgument, fallas.RequestInvalida, "falta card_token")
 	}
 	if !mandatoria.CoordenadasValidas(req.Latitude, req.Longitude) {
-		return nil, status.Errorf(codes.InvalidArgument,
-			"coordenadas inválidas o ausentes: (%v, %v)", req.Latitude, req.Longitude)
+		return nil, fallas.Nueva(codes.InvalidArgument, fallas.RequestInvalida,
+			fmt.Sprintf("coordenadas inválidas o ausentes: (%v, %v)", req.Latitude, req.Longitude))
 	}
 	// Desde la Etapa 4: el scoring usa ln(monto), que no existe para montos
 	// <= 0. Se escribe !(x > 0) y no x <= 0 a propósito: NaN no es mayor ni
 	// menor que nada, así que !(NaN > 0) es true y también se rechaza.
 	if !(req.Amount > 0) {
-		return nil, status.Errorf(codes.InvalidArgument, "amount inválido: %v", req.Amount)
+		return nil, fallas.Nueva(codes.InvalidArgument, fallas.RequestInvalida, fmt.Sprintf("amount inválido: %v", req.Amount))
 	}
 	if req.MerchantCategory == "" {
-		return nil, status.Error(codes.InvalidArgument, "falta merchant_category")
+		return nil, fallas.Nueva(codes.InvalidArgument, fallas.RequestInvalida, "falta merchant_category")
 	}
 
 	// rechazar arma la respuesta de fraude y la manda a Settlement. Un
@@ -146,7 +148,7 @@ func (s *fraudEngineServer) EvaluateTransaction(ctx context.Context, req *pb.Tra
 		return nil, fallaDeVerificacion(req.TxId, err) // datos corruptos en Redis
 	}
 	if !conocida {
-		return nil, status.Errorf(codes.InvalidArgument, "merchant_category desconocida: %q", req.MerchantCategory)
+		return nil, fallas.Nueva(codes.InvalidArgument, fallas.CategoriaDesconocida, fmt.Sprintf("merchant_category desconocida: %q", req.MerchantCategory))
 	}
 
 	// 1. Blacklist.
@@ -282,9 +284,9 @@ func (s *fraudEngineServer) liquidar(ctx context.Context, req *pb.TransactionReq
 		if eval.IsFraud {
 			return eval, nil // el rechazo vale igual
 		}
-		return nil, status.Error(codes.DeadlineExceeded, "la transacción superó el deadline global y no se comprometió")
+		return nil, fallas.Nueva(codes.DeadlineExceeded, fallas.AbortadaPorTimeout, "la transacción superó el deadline global y no se comprometió")
 	default:
-		return nil, status.Errorf(codes.Internal, "estado inesperado de Settlement: %v", sr.Status)
+		return nil, fallas.Nueva(codes.Internal, fallas.EstadoInesperado, fmt.Sprintf("estado inesperado de Settlement: %v", sr.Status))
 	}
 }
 
@@ -309,9 +311,10 @@ func leerCSettle(trailer metadata.MD) (time.Duration, bool) {
 func fallaDeSettlement(txID string, err error) error {
 	log.Printf("tx_id=%s SIN COMMIT: %v", txID, err)
 	if status.Code(err) == codes.DeadlineExceeded {
-		return status.Error(codes.DeadlineExceeded, "se agotó el tiempo esperando a Settlement")
+		// AMBIGUO: pudo haberse comprometido igual (ver Etapa 5).
+		return fallas.Nueva(codes.DeadlineExceeded, fallas.SettlementTimeout, "se agotó el tiempo esperando a Settlement")
 	}
-	return status.Error(codes.Unavailable, "no se pudo comprometer la transacción")
+	return fallas.Nueva(codes.Unavailable, fallas.SettlementNoDisponible, "no se pudo comprometer la transacción")
 }
 
 // fallaDeVerificacion traduce un error de Redis a un código gRPC. En los
@@ -321,10 +324,10 @@ func fallaDeVerificacion(txID string, err error) error {
 	log.Printf("tx_id=%s SIN VERIFICAR: %v", txID, err)
 	// Se acabó el deadline de la request mientras esperábamos a Redis.
 	if errors.Is(err, context.DeadlineExceeded) {
-		return status.Error(codes.DeadlineExceeded, "se agotó el deadline verificando la transacción")
+		return fallas.Nueva(codes.DeadlineExceeded, fallas.RedisTimeout, "se agotó el deadline verificando la transacción")
 	}
 	// Redis caído o inalcanzable.
-	return status.Error(codes.Unavailable, "no se pudo verificar la transacción")
+	return fallas.Nueva(codes.Unavailable, fallas.RedisNoDisponible, "no se pudo verificar la transacción")
 }
 
 func main() {

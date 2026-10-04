@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
+	"fd_rts/internal/fallas"
 	"fd_rts/internal/mandatoria"
 	"fd_rts/internal/opcional"
 	"fd_rts/internal/presupuesto"
@@ -571,5 +572,41 @@ func TestAmbiguedadDelTimeout(t *testing.T) {
 	}
 	if est, _ := rdb.HGet(context.Background(), clave, "estado").Result(); est != "STATUS_COMMITTED" {
 		t.Errorf("registro tras el reintento = %q, se esperaba STATUS_COMMITTED", est)
+	}
+}
+
+// Cada situación llega al cliente con su motivo (ErrorInfo.Reason), aunque
+// varias compartan el código gRPC. Es lo que usa el loadgen para clasificar.
+func TestMotivosDeError(t *testing.T) {
+	casos := []struct {
+		nombre     string
+		preparar   func(t *testing.T, s *fraudEngineServer)
+		req        *pb.TransactionRequest
+		timeout    time.Duration
+		wantCodigo codes.Code
+		wantMotivo string
+	}{
+		{"early drop", nil, txValida("t1", "tok-ok", baLat, baLon), 5 * time.Millisecond, codes.DeadlineExceeded, fallas.EarlyDrop},
+		{"request inválida", nil, txValida("", "tok-ok", baLat, baLon), 200 * time.Millisecond, codes.InvalidArgument, fallas.RequestInvalida},
+		{"categoría desconocida", nil, conCategoria(txValida("t1", "tok-ok", baLat, baLon), "no_existe"), 200 * time.Millisecond, codes.InvalidArgument, fallas.CategoriaDesconocida},
+		// Mismo código que el early drop, otro motivo: este es AMBIGUO.
+		{"settlement lento", func(t *testing.T, s *fraudEngineServer) {
+			rdb := redisclient.Nuevo(redisAddr)
+			t.Cleanup(func() { rdb.Close() })
+			s.settle = levantarSettlement(t, settlementLento{settlement.NuevoServidor(rdb, "test:lento:"), 100 * time.Millisecond})
+		}, txValida("t1", "tok-ok", baLat, baLon), 90 * time.Millisecond, codes.DeadlineExceeded, fallas.SettlementTimeout},
+	}
+	for _, c := range casos {
+		t.Run(c.nombre, func(t *testing.T) {
+			s := nuevoServerDePrueba(t)
+			if c.preparar != nil {
+				c.preparar(t, s)
+			}
+			_, err := evaluarCon(t, s, c.req, c.timeout)
+			if status.Code(err) != c.wantCodigo || fallas.Motivo(err) != c.wantMotivo {
+				t.Errorf("código=%v motivo=%q, se esperaba código=%v motivo=%q",
+					status.Code(err), fallas.Motivo(err), c.wantCodigo, c.wantMotivo)
+			}
+		})
 	}
 }
