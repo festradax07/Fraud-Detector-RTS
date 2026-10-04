@@ -1,0 +1,12 @@
+# Datasource provisionado: Grafana arranca ya conectado a Prometheus.
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    uid: prometheus # el dashboard lo referencia por este uid fijo
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090 # nombre del servicio en la red de compose
+    isDefault: true
+    jsonData:
+      # Igual al scrape_interval: Grafana calcula $__rate_interval con esto.
+      timeInterval: 1s

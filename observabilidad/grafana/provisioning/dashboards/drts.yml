@@ -1,0 +1,11 @@
+# Carga los dashboards de /var/lib/grafana/dashboards (montado desde
+# observabilidad/grafana/dashboards). Se editan en el JSON, no en la UI.
+apiVersion: 1
+providers:
+  - name: drts
+    folder: D-RTS
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards

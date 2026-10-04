@@ -10,6 +10,7 @@ import (
 
 	"google.golang.org/grpc"
 
+	"fd_rts/internal/metricas"
 	"fd_rts/internal/redisclient"
 	"fd_rts/internal/settlement"
 	pb "fd_rts/proto"
@@ -17,8 +18,9 @@ import (
 
 // Fijos por ahora; en la Etapa 7.5 pasan a variables de entorno.
 const (
-	addr      = ":50052"
-	redisAddr = "localhost:6379"
+	addr         = ":50052"
+	redisAddr    = "localhost:6379"
+	metricasAddr = ":2113" // /metrics para Prometheus (Etapa 7)
 )
 
 func main() {
@@ -37,7 +39,19 @@ func main() {
 	if err != nil {
 		log.Fatalf("no pude escuchar en %s: %v", addr, err)
 	}
-	grpcServer := grpc.NewServer()
+	// Métricas (Etapa 7). Los estados y la latencia de extremo a extremo
+	// salen de la respuesta: el handler no se toca.
+	reg := metricas.NuevoRegistro()
+	rpc := metricas.NuevoRPC(reg, "settlement")
+	dominio := metricas.NuevoSettlement(reg)
+	metricas.Servir(metricasAddr, reg)
+	log.Printf("métricas en http://localhost%s/metrics", metricasAddr)
+
+	grpcServer := grpc.NewServer(grpc.UnaryInterceptor(rpc.Interceptor(func(resp any) {
+		if r, ok := resp.(*pb.SettlementResponse); ok {
+			dominio.Registrado(r.Status.String(), time.Duration(r.EndToEndLatencyMs)*time.Millisecond)
+		}
+	})))
 	pb.RegisterSettlementServer(grpcServer, settlement.NuevoServidor(rdb, "drts:"))
 
 	log.Printf("settlement escuchando en %s", addr)

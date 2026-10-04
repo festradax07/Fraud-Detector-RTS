@@ -1,0 +1,52 @@
+# Observabilidad del D-RTS (Etapa 7): Prometheus + Grafana, ya provisionados.
+#
+#   docker compose up -d       # levantar
+#   docker compose down        # bajar (los datos de Prometheus quedan en un volumen)
+#
+# Grafana: http://localhost:3000 (sin login, el dashboard es la página de inicio)
+# Prometheus: http://localhost:9090
+#
+# Los servicios del D-RTS (Fraud-Engine, Settlement, loadgen) corren en el
+# HOST, no acá: Prometheus los scrapea vía host.docker.internal. Meterlos en
+# contenedores es la Etapa 7.5. Redis corre aparte (contenedor redis-drts).
+name: drts-observabilidad
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.15.0 # versión fija: el entorno se levanta igual siempre
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./observabilidad/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-datos:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090" # solo localhost: no exponer a la red
+    extra_hosts:
+      # En Linux, host.docker.internal no existe por defecto: host-gateway
+      # lo resuelve a la IP del host vista desde el contenedor.
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:13.2.3
+    environment:
+      # Entorno local de estudio: sin login (por eso el puerto va atado a
+      # 127.0.0.1). NO usar esta configuración expuesta a una red.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      # Por defecto Grafana no deja refrescar más rápido que 5s.
+      GF_DASHBOARDS_MIN_REFRESH_INTERVAL: 1s
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/drts.json
+    volumes:
+      - ./observabilidad/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observabilidad/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  prometheus-datos: {}

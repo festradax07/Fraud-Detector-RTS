@@ -21,6 +21,7 @@ import (
 
 	"fd_rts/internal/fallas"
 	"fd_rts/internal/mandatoria"
+	"fd_rts/internal/metricas"
 	"fd_rts/internal/opcional"
 	"fd_rts/internal/presupuesto"
 	"fd_rts/internal/redisclient"
@@ -53,12 +54,18 @@ const redisAddr = "localhost:6379"
 // redisAddr: pasa a variable de entorno en la Etapa 7.5.
 const settlementAddr = "localhost:50052"
 
+// metricasAddr: dónde se expone /metrics para Prometheus (Etapa 7).
+const metricasAddr = ":2112"
+
 type fraudEngineServer struct {
 	pb.UnimplementedFraudEngineServer
 	verificador *mandatoria.Verificador
 	// settle es el cliente gRPC de Settlement: desde la Etapa 5 el
 	// Fraud-Engine es servidor (de los clientes) Y cliente (de Settlement).
 	settle pb.SettlementClient
+	// metricas del modelo temporal (Etapa 7). Puede ser nil: los métodos no
+	// hacen nada en ese caso.
+	metricas *metricas.Motor
 }
 
 func (s *fraudEngineServer) EvaluateTransaction(ctx context.Context, req *pb.TransactionRequest) (*pb.EvaluationResponse, error) {
@@ -78,6 +85,8 @@ func (s *fraudEngineServer) EvaluateTransaction(ctx context.Context, req *pb.Tra
 
 	// D_rem = deadline - ahora. Si no alcanza para el trabajo mínimo, corte.
 	remaining := time.Until(deadline)
+	// Etapa 7: si este valor baja de ~200ms, hay espera ANTES del handler.
+	s.metricas.DRemLlegada(remaining)
 	if !presupuesto.Admitir(remaining) {
 		log.Printf("tx_id=%s EARLY DROP: quedan %v, mínimo %v", req.TxId, remaining, presupuesto.MinParaAdmitir)
 		return nil, fallas.Nueva(codes.DeadlineExceeded, fallas.EarlyDrop,
@@ -130,7 +139,9 @@ func (s *fraudEngineServer) EvaluateTransaction(ctx context.Context, req *pb.Tra
 	// velocidad cuenta todos los intentos) y trae blacklist, intentos y
 	// posición previa, todo junto. Va con el ctx de la request: el deadline
 	// del cliente llega hasta Redis.
+	tMandatoria := time.Now()
 	res, err := v.Consultar(ctx, req.TxId, req.CardToken, req.MerchantCategory, req.Latitude, req.Longitude, ahora)
+	s.metricas.Fase(metricas.FaseMandatoria, time.Since(tMandatoria))
 	if err != nil {
 		return nil, fallaDeVerificacion(req.TxId, err)
 	}
@@ -173,6 +184,7 @@ func (s *fraudEngineServer) EvaluateTransaction(ctx context.Context, req *pb.Tra
 	// D_rem se recalcula ACÁ: lo que importa es cuánto queda ahora, con la
 	// mandatoria y el viaje a Redis ya pagados.
 	dRem := time.Until(deadline)
+	s.metricas.Slack(presupuesto.Slack(dRem))
 	var riskScore float64
 	degradada := !presupuesto.CorreOpcional(dRem)
 
@@ -181,7 +193,9 @@ func (s *fraudEngineServer) EvaluateTransaction(ctx context.Context, req *pb.Tra
 		// de no haber corrido el scoring a cambio de cumplir el deadline.
 		log.Printf("tx_id=%s DEGRADADA: quedan %v, slack %v", req.TxId, dRem, presupuesto.Slack(dRem))
 	} else {
+		tOpcional := time.Now()
 		riskScore = opcional.Puntuar(req.Amount, stats, iteracionesScoring)
+		s.metricas.Fase(metricas.FaseOpcional, time.Since(tOpcional))
 		if riskScore > opcional.UmbralRechazo {
 			log.Printf("tx_id=%s FRAUDE %s: score %.3f", req.TxId, motivoRiesgoAlto, riskScore)
 			return rechazar(motivoRiesgoAlto, riskScore)
@@ -241,9 +255,12 @@ func (s *fraudEngineServer) liquidar(ctx context.Context, req *pb.TransactionReq
 		EmissionTimestampNs: req.EmissionTimestampNs,
 	}, grpc.Trailer(&trailer))
 	total := time.Since(t0)
+	s.metricas.Fase(metricas.FaseSettlement, total)
 
 	// Medición de C_settle y C_net (ver internal/settlement).
 	if cSettle, ok := leerCSettle(trailer); ok {
+		s.metricas.Fase(metricas.FaseCSettle, cSettle)
+		s.metricas.Fase(metricas.FaseCNet, total-cSettle)
 		log.Printf("tx_id=%s settlement: total=%v c_settle=%v c_net=%v", req.TxId, total, cSettle, total-cSettle)
 	} else {
 		log.Printf("tx_id=%s settlement: total=%v (sin trailer)", req.TxId, total)
@@ -367,13 +384,27 @@ func main() {
 	defer connSettle.Close()
 	connSettle.Connect()
 
-	grpcServer := grpc.NewServer()
+	// Métricas (Etapa 7): registro propio, expuesto en /metrics.
+	reg := metricas.NuevoRegistro()
+	rpc := metricas.NuevoRPC(reg, "fraud_engine")
+	motor := metricas.NuevoMotor(reg)
+	metricas.Servir(metricasAddr, reg)
+	log.Printf("métricas en http://localhost%s/metrics", metricasAddr)
+
+	// El interceptor envuelve cada llamada: tasa, errores por motivo,
+	// latencia, en vuelo, tardías. Las decisiones salen de la respuesta.
+	grpcServer := grpc.NewServer(grpc.UnaryInterceptor(rpc.Interceptor(func(resp any) {
+		if r, ok := resp.(*pb.EvaluationResponse); ok {
+			motor.Decision(r.IsFraud, r.RejectionReason, r.IsDegraded)
+		}
+	})))
 	// La blacklist ya no está en el código: es el SET drts:blacklist en
 	// Redis (se carga con SADD, ver docs/GUIA-GO.md).
 	verificador := mandatoria.NuevoVerificador(rdb, "drts:")
 	pb.RegisterFraudEngineServer(grpcServer, &fraudEngineServer{
 		verificador: verificador,
 		settle:      pb.NewSettlementClient(connSettle),
+		metricas:    motor,
 	})
 
 	log.Printf("fraud-engine escuchando en %s", addr)
