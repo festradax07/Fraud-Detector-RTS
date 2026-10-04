@@ -1,0 +1,21 @@
+# Prometheus del D-RTS (Etapa 7).
+global:
+  # 1s y no los 15s por defecto: una corrida del loadgen dura ~30s; con 15s
+  # serían dos puntos y no se vería nada en vivo. Costo: más muestras
+  # guardadas (irrelevante en local).
+  scrape_interval: 1s
+  evaluation_interval: 1s
+
+scrape_configs:
+  # Los servicios corren en el host (ver docker-compose.yml).
+  - job_name: fraud_engine
+    static_configs:
+      - targets: ["host.docker.internal:2112"]
+  - job_name: settlement
+    static_configs:
+      - targets: ["host.docker.internal:2113"]
+  # El loadgen existe solo mientras corre una carga: el resto del tiempo
+  # este target figura "down", y es normal.
+  - job_name: loadgen
+    static_configs:
+      - targets: ["host.docker.internal:2114"]

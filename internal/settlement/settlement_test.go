@@ -57,7 +57,9 @@ func levantarSettlement(t *testing.T, redisAddr string) *entorno {
 		conn.Close()
 		g.Stop()
 		ctx := context.Background()
-		iter := rdb.Scan(ctx, 0, prefijo+"*", 100).Iterator()
+		// SCAN recorre TODA la base y después filtra por el patrón: con COUNT
+		// alto son menos viajes (con 100 y 200k claves eran ~2000 por test).
+		iter := rdb.Scan(ctx, 0, prefijo+"*", 10000).Iterator()
 		for iter.Next(ctx) {
 			rdb.Del(ctx, iter.Val())
 		}

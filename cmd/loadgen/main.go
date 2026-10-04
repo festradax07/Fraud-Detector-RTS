@@ -36,12 +36,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
 	"fd_rts/internal/fallas"
+	"fd_rts/internal/metricas"
 	pb "fd_rts/proto"
 )
 
@@ -138,11 +140,64 @@ type generador struct {
 	deadline    time.Duration
 	maxIntentos int
 	corrida     string // prefijo único de tx_id y tarjetas
+	met         *metricasLoadgen
+}
+
+// metricasLoadgen: la vista del CLIENTE, en vivo (Etapa 7). Es la única que
+// ve los DEADLINE_MISS: el servidor cree que respondió bien.
+type metricasLoadgen struct {
+	ofrecidas   prometheus.Counter
+	resultados  *prometheus.CounterVec
+	latencia    *prometheus.HistogramVec
+	retraso     prometheus.Histogram
+	enVuelo     prometheus.Gauge
+	reintentos  *prometheus.CounterVec
+	rpsObjetivo prometheus.Gauge
+}
+
+func nuevasMetricasLoadgen(reg prometheus.Registerer) *metricasLoadgen {
+	m := &metricasLoadgen{
+		ofrecidas: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "drts_loadgen_ofrecidas_total",
+			Help: "Transacciones lanzadas (carga ofrecida).",
+		}),
+		resultados: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "drts_loadgen_resultados_total",
+			Help: "Resultado del primer intento, por categoría (PROCESSED, EARLY_DROP, DEADLINE_MISS, AMBIGUOUS, ERROR) y motivo.",
+		}, []string{"categoria", "motivo"}),
+		latencia: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "drts_loadgen_latencia_segundos",
+			Help:    "Latencia vista por el cliente, desde el instante PROGRAMADO de llegada.",
+			Buckets: metricas.BucketsLatencia,
+		}, []string{"categoria"}),
+		retraso: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "drts_loadgen_retraso_lanzamiento_segundos",
+			Help:    "Cuánto tarde salió cada transacción respecto de lo programado. Si crece, el generador no sigue el ritmo.",
+			Buckets: metricas.BucketsFase,
+		}),
+		enVuelo: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "drts_loadgen_en_vuelo",
+			Help: "Transacciones esperando respuesta.",
+		}),
+		reintentos: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "drts_loadgen_reintentos_total",
+			Help: "Reintentos de transacciones ambiguas, por resultado del reintento.",
+		}, []string{"resultado"}),
+		rpsObjetivo: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "drts_loadgen_rps_objetivo",
+			Help: "Tasa de llegadas pedida en esta corrida.",
+		}),
+	}
+	reg.MustRegister(m.ofrecidas, m.resultados, m.latencia, m.retraso, m.enVuelo, m.reintentos, m.rpsObjetivo)
+	return m
 }
 
 // enviar manda la transacción i y la sigue hasta un resultado final.
 func (g *generador) enviar(i int, f fila, programada time.Time) resultado {
 	r := resultado{i: i, programada: programada, retraso: time.Since(programada)}
+	g.met.retraso.Observe(r.retraso.Seconds())
+	g.met.enVuelo.Inc()
+	defer g.met.enVuelo.Dec()
 
 	txID := fmt.Sprintf("%s-%d", g.corrida, i)
 	req := &pb.TransactionRequest{
@@ -169,9 +224,14 @@ func (g *generador) enviar(i int, f fila, programada time.Time) resultado {
 		if intento == 1 {
 			r.latencia = time.Since(programada)
 			r.cat, r.motivo = cat, motivo
+			g.met.resultados.WithLabelValues(cat, motivo).Inc()
+			g.met.latencia.WithLabelValues(cat).Observe(r.latencia.Seconds())
 			if resp != nil {
 				r.fraude, r.rechazo, r.degradada = resp.IsFraud, resp.RejectionReason, resp.IsDegraded
 			}
+		}
+		if intento > 1 {
+			g.met.reintentos.WithLabelValues(cat).Inc()
 		}
 		if cat != catAmbigua {
 			break // resultado conocido: no hace falta reintentar
@@ -191,6 +251,8 @@ func main() {
 	maxIntentos := flag.Int("intentos", 3, "máximo de intentos ante resultado ambiguo")
 	semilla := flag.Uint64("semilla", 1, "semilla del generador de llegadas (reproducible)")
 	salida := flag.String("salida", "", "CSV de resultados (default: resultados/loadgen-<modo>-<hora>.csv)")
+	metricasAddr := flag.String("metricas", ":2114", "dónde exponer /metrics para Prometheus (vacío: no exponer)")
+	gracia := flag.Duration("gracia", 3*time.Second, "cuánto mantener /metrics abierto al terminar, para el último scrape")
 	flag.Parse()
 
 	rps := *rpsFlag
@@ -214,12 +276,21 @@ func main() {
 	}
 	defer conn.Close()
 
+	reg := metricas.NuevoRegistro()
+	met := nuevasMetricasLoadgen(reg)
+	met.rpsObjetivo.Set(rps)
+	if *metricasAddr != "" {
+		metricas.Servir(*metricasAddr, reg)
+		log.Printf("métricas en http://localhost%s/metrics", *metricasAddr)
+	}
+
 	inicio := time.Now()
 	g := &generador{
 		cliente:     pb.NewFraudEngineClient(conn),
 		deadline:    *deadline,
 		maxIntentos: *maxIntentos,
 		corrida:     fmt.Sprintf("lg%d", inicio.Unix()),
+		met:         met,
 	}
 	calentar(g.cliente)
 
@@ -257,6 +328,7 @@ func main() {
 		}
 		time.Sleep(time.Until(proxima)) // si ya pasó, no duerme
 
+		met.ofrecidas.Inc()
 		wg.Add(1)
 		go func(i int, f fila, programada time.Time) {
 			defer wg.Done()
@@ -279,6 +351,13 @@ func main() {
 		log.Fatalf("escribiendo %s: %v", *salida, err)
 	}
 	log.Printf("resultados por transacción en %s", *salida)
+
+	if *metricasAddr != "" && *gracia > 0 {
+		// Prometheus scrapea cada 1s: sin esta espera, lo último que pasó en
+		// la corrida podría no llegar a leerse antes de que el proceso muera.
+		log.Printf("manteniendo /metrics %v para el último scrape", *gracia)
+		time.Sleep(*gracia)
+	}
 }
 
 // calentar manda una transacción inválida para abrir la conexión gRPC antes

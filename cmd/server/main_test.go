@@ -3,12 +3,17 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -18,6 +23,7 @@ import (
 
 	"fd_rts/internal/fallas"
 	"fd_rts/internal/mandatoria"
+	"fd_rts/internal/metricas"
 	"fd_rts/internal/opcional"
 	"fd_rts/internal/presupuesto"
 	"fd_rts/internal/redisclient"
@@ -114,7 +120,9 @@ func nuevoServerConRedis(t *testing.T) (*fraudEngineServer, *redis.Client, strin
 	prefijo := fmt.Sprintf("test:%d:%d:", os.Getpid(), time.Now().UnixNano())
 	t.Cleanup(func() {
 		ctx := context.Background()
-		iter := rdb.Scan(ctx, 0, prefijo+"*", 100).Iterator()
+		// SCAN recorre TODA la base y después filtra por el patrón: con COUNT
+		// alto son menos viajes (con 100 y 200k claves eran ~2000 por test).
+		iter := rdb.Scan(ctx, 0, prefijo+"*", 10000).Iterator()
 		for iter.Next(ctx) {
 			rdb.Del(ctx, iter.Val())
 		}
@@ -608,5 +616,74 @@ func TestMotivosDeError(t *testing.T) {
 					status.Code(err), fallas.Motivo(err), c.wantCodigo, c.wantMotivo)
 			}
 		})
+	}
+}
+
+// Métricas de punta a punta: engine real (gRPC con el interceptor) en un
+// puerto real, requests por red, y /metrics leído por HTTP como lo haría
+// Prometheus.
+func TestMetricasDePuntaAPunta(t *testing.T) {
+	s := nuevoServerDePrueba(t)
+	reg := metricas.NuevoRegistro()
+	rpc := metricas.NuevoRPC(reg, "fraud_engine")
+	s.metricas = metricas.NuevoMotor(reg)
+
+	lis, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	g := grpc.NewServer(grpc.UnaryInterceptor(rpc.Interceptor(func(resp any) {
+		if r, ok := resp.(*pb.EvaluationResponse); ok {
+			s.metricas.Decision(r.IsFraud, r.RejectionReason, r.IsDegraded)
+		}
+	})))
+	pb.RegisterFraudEngineServer(g, s)
+	go g.Serve(lis)
+	t.Cleanup(g.Stop)
+
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("cliente: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	c := pb.NewFraudEngineClient(conn)
+
+	llamar := func(req *pb.TransactionRequest, timeout time.Duration) {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		c.EvaluateTransaction(ctx, req)
+	}
+	llamar(txValida("a1", "tok-a1", baLat, baLon), 200*time.Millisecond)     // aprobada
+	llamar(txValida("a2", "tok-robada", baLat, baLon), 200*time.Millisecond) // BLACKLIST
+	llamar(txValida("a3", "tok-a3", baLat, baLon), 60*time.Millisecond)      // degradada
+	llamar(txValida("a4", "tok-a4", baLat, baLon), 5*time.Millisecond)       // early drop
+
+	// /metrics por HTTP real.
+	web := httptest.NewServer(promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+	defer web.Close()
+	resp, err := http.Get(web.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	cuerpo, _ := io.ReadAll(resp.Body)
+	texto := string(cuerpo)
+
+	// Líneas que tienen que estar, tal cual las ve Prometheus.
+	for _, want := range []string{
+		`drts_requests_total{codigo="OK",motivo="",servicio="fraud_engine"} 3`,
+		`drts_requests_total{codigo="DeadlineExceeded",motivo="EARLY_DROP",servicio="fraud_engine"} 1`,
+		`drts_decisiones_total{decision="aprobada",degradada="no",motivo=""} 1`,
+		`drts_decisiones_total{decision="aprobada",degradada="si",motivo=""} 1`,
+		`drts_decisiones_total{decision="rechazada",degradada="no",motivo="BLACKLIST"} 1`,
+		`drts_drem_llegada_segundos_count 4`, // las 4 llegaron, incluida la del early drop
+		`drts_fase_segundos_count{fase="mandatoria"} 3`,
+		`drts_fase_segundos_count{fase="opcional"} 1`, // solo la aprobada con slack
+		`drts_en_vuelo{servicio="fraud_engine"} 0`,
+		`go_goroutines`, // runtime de Go, gratis
+	} {
+		if !strings.Contains(texto, want) {
+			t.Errorf("/metrics no contiene %q", want)
+		}
 	}
 }
