@@ -69,6 +69,12 @@ type Resultado struct {
 	// Kmh es la velocidad implícita desde la posición previa. Solo tiene
 	// sentido si HayPrevia.
 	Kmh float64
+	// StatsCategoria es el hash crudo de estadísticas de la categoría, para
+	// la fase opcional (lo interpreta opcional.ParsearEstadisticas). Vacío
+	// si la categoría no existe. Viaja en el mismo pipeline aunque después
+	// la request se degrade: son unos bytes en el mismo viaje, y pedirlo
+	// después costaría un viaje de red entero.
+	StatsCategoria map[string]string
 }
 
 // Verificador ejecuta la fase mandatoria contra Redis.
@@ -113,13 +119,20 @@ func NuevoVerificador(rdb *redis.Client, prefijo string) *Verificador {
 
 // Claves de Redis. Una función por clave para que el formato esté en un
 // solo lugar.
-func (v *Verificador) claveBlacklist() string            { return v.prefijo + "blacklist" }
-func (v *Verificador) claveVelocidad(card string) string { return v.prefijo + "vel:" + card }
-func (v *Verificador) clavePosicion(card string) string  { return v.prefijo + "pos:" + card }
+func (v *Verificador) claveBlacklist() string             { return v.prefijo + "blacklist" }
+func (v *Verificador) claveVelocidad(card string) string  { return v.prefijo + "vel:" + card }
+func (v *Verificador) clavePosicion(card string) string   { return v.prefijo + "pos:" + card }
+func (v *Verificador) claveStats(categoria string) string { return v.prefijo + "stats:" + categoria }
 
 // Bloquear agrega una tarjeta a la blacklist (SADD).
 func (v *Verificador) Bloquear(ctx context.Context, cardToken string) error {
 	return v.rdb.SAdd(ctx, v.claveBlacklist(), cardToken).Err()
+}
+
+// GuardarEstadisticas escribe el hash de estadísticas de una categoría
+// (HSET). Lo usan cmd/cargar-stats y los tests; el hot path solo lee.
+func (v *Verificador) GuardarEstadisticas(ctx context.Context, categoria string, campos map[string]any) error {
+	return v.rdb.HSet(ctx, v.claveStats(categoria), campos).Err()
 }
 
 // Consultar registra el intento y trae todo lo que la fase mandatoria
@@ -128,13 +141,15 @@ func (v *Verificador) Bloquear(ctx context.Context, cardToken string) error {
 //	SISMEMBER                                  → ¿blacklist?
 //	ZREMRANGEBYSCORE + ZADD + ZCARD + EXPIRE   → intentos en la ventana
 //	GET                                        → última posición confiable
+//	HGETALL                                    → estadísticas de la categoría
+//	                                             (para la fase opcional)
 //
 // Va en un TxPipeline (MULTI/EXEC): un solo viaje como cualquier pipeline,
 // y además atómico, sin comandos de otros clientes intercalados.
 //
 // No decide nada: quien llama compara contra MaxIntentos y VelocidadMaxKmh.
 // Un error significa que NO se pudo verificar (fail-closed: no aprobar).
-func (v *Verificador) Consultar(ctx context.Context, txID, cardToken string, lat, lon float64, ahora time.Time) (Resultado, error) {
+func (v *Verificador) Consultar(ctx context.Context, txID, cardToken, categoria string, lat, lon float64, ahora time.Time) (Resultado, error) {
 	claveVel := v.claveVelocidad(cardToken)
 
 	// Scores en milisegundos: son double en Redis (exactos hasta ~9e15);
@@ -158,6 +173,7 @@ func (v *Verificador) Consultar(ctx context.Context, txID, cardToken string, lat
 	// de memoria de la Etapa 2.
 	pipe.Expire(ctx, claveVel, VentanaVelocidad)
 	posGuardada := pipe.Get(ctx, v.clavePosicion(cardToken))
+	stats := pipe.HGetAll(ctx, v.claveStats(categoria))
 
 	// Recién acá viaja todo junto: 1 RTT.
 	//
@@ -168,8 +184,9 @@ func (v *Verificador) Consultar(ctx context.Context, txID, cardToken string, lat
 	}
 
 	res := Resultado{
-		EnBlacklist: enBlacklist.Val(),
-		Intentos:    intentos.Val(),
+		EnBlacklist:    enBlacklist.Val(),
+		Intentos:       intentos.Val(),
+		StatsCategoria: stats.Val(), // HGETALL de una clave inexistente: map vacío
 	}
 
 	valor, err := posGuardada.Result()

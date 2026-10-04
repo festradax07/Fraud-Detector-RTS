@@ -6,3 +6,6 @@
 # Documentos privados
 /docs/
 /CLAUDE.md
+
+# Datasets (pesados, se bajan aparte)
+/data/

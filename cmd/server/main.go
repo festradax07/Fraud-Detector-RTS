@@ -1,7 +1,7 @@
 // Fraud-Engine: decide si una transacción se aprueba o rechaza bajo un
-// deadline duro de 200ms. Hoy implementa el control de admisión (Etapa 1) y
-// la fase mandatoria (Etapa 2). La fase opcional y el slack time llegan en
-// la Etapa 4.
+// deadline duro de 200ms. Implementa el control de admisión (Etapa 1), la
+// fase mandatoria contra Redis (Etapas 2 y 3) y la fase opcional según el
+// slack time (Etapa 4).
 package main
 
 import (
@@ -16,6 +16,8 @@ import (
 	"google.golang.org/grpc/status"
 
 	"fd_rts/internal/mandatoria"
+	"fd_rts/internal/opcional"
+	"fd_rts/internal/presupuesto"
 	pb "fd_rts/proto"
 )
 
@@ -26,13 +28,15 @@ const (
 	motivoBlacklist      = "BLACKLIST"
 	motivoCardTesting    = "CARD_TESTING"
 	motivoViajeImposible = "VIAJE_IMPOSIBLE"
+	motivoRiesgoAlto     = "RIESGO_ALTO" // fase opcional: score > umbral
 )
 
-// minBudget es el tiempo mínimo que tiene que quedar para que valga la pena
-// procesar una transacción: WCET(fase mandatoria) + C_settle + C_net.
-// ~35ms es un PUNTO DE PARTIDA de diseño, no un resultado medido: se
-// recalibra midiendo en esta máquina (Etapa 10).
-const minBudget = 35 * time.Millisecond
+// iteracionesScoring fija el costo de CPU SIMULADO del scoring (el Z-score
+// real tarda ~40ns; esto simula un modelo más pesado). Medido en esta
+// máquina (Etapa 4): 10M ≈ 16ms de media, ≈ 19ms de máximo, cómodo dentro
+// de WCET(O) = 80ms. Es una perilla para las Etapas 6 y 10, no un valor del
+// modelo.
+const iteracionesScoring = 10_000_000
 
 // redisAddr es fijo por ahora. En la Etapa 7.5 pasa a una variable de
 // entorno (REDIS_ADDR).
@@ -60,10 +64,10 @@ func (s *fraudEngineServer) EvaluateTransaction(ctx context.Context, req *pb.Tra
 
 	// D_rem = deadline - ahora. Si no alcanza para el trabajo mínimo, corte.
 	remaining := time.Until(deadline)
-	if remaining < minBudget {
-		log.Printf("tx_id=%s EARLY DROP: quedan %v, mínimo %v", req.TxId, remaining, minBudget)
+	if !presupuesto.Admitir(remaining) {
+		log.Printf("tx_id=%s EARLY DROP: quedan %v, mínimo %v", req.TxId, remaining, presupuesto.MinParaAdmitir)
 		return nil, status.Errorf(codes.DeadlineExceeded,
-			"deadline insuficiente: quedan %v, se necesitan al menos %v", remaining, minBudget)
+			"deadline insuficiente: quedan %v, se necesitan al menos %v", remaining, presupuesto.MinParaAdmitir)
 	}
 
 	// Validación de la request: sin tarjeta o sin coordenadas no hay con qué
@@ -80,6 +84,15 @@ func (s *fraudEngineServer) EvaluateTransaction(ctx context.Context, req *pb.Tra
 	if !mandatoria.CoordenadasValidas(req.Latitude, req.Longitude) {
 		return nil, status.Errorf(codes.InvalidArgument,
 			"coordenadas inválidas o ausentes: (%v, %v)", req.Latitude, req.Longitude)
+	}
+	// Desde la Etapa 4: el scoring usa ln(monto), que no existe para montos
+	// <= 0. Se escribe !(x > 0) y no x <= 0 a propósito: NaN no es mayor ni
+	// menor que nada, así que !(NaN > 0) es true y también se rechaza.
+	if !(req.Amount > 0) {
+		return nil, status.Errorf(codes.InvalidArgument, "amount inválido: %v", req.Amount)
+	}
+	if req.MerchantCategory == "" {
+		return nil, status.Error(codes.InvalidArgument, "falta merchant_category")
 	}
 
 	// rechazar arma la respuesta de fraude. Un fraude NO es un error gRPC:
@@ -102,9 +115,25 @@ func (s *fraudEngineServer) EvaluateTransaction(ctx context.Context, req *pb.Tra
 	// velocidad cuenta todos los intentos) y trae blacklist, intentos y
 	// posición previa, todo junto. Va con el ctx de la request: el deadline
 	// del cliente llega hasta Redis.
-	res, err := v.Consultar(ctx, req.TxId, req.CardToken, req.Latitude, req.Longitude, ahora)
+	res, err := v.Consultar(ctx, req.TxId, req.CardToken, req.MerchantCategory, req.Latitude, req.Longitude, ahora)
 	if err != nil {
 		return nil, fallaDeVerificacion(req.TxId, err)
+	}
+
+	// Estadísticas de la categoría (llegaron en el mismo viaje). Una
+	// categoría sin estadísticas es un error del cliente y se rechaza
+	// (fail-closed: sin estadísticas no hay cómo puntuar). Se rechaza
+	// aunque después la request fuera a degradarse.
+	//
+	// Nota: el intento ya quedó registrado en la ventana de velocidad (el
+	// ZADD iba en el mismo pipeline). Es aceptable: contar de más es el lado
+	// seguro.
+	stats, conocida, err := opcional.ParsearEstadisticas(res.StatsCategoria)
+	if err != nil {
+		return nil, fallaDeVerificacion(req.TxId, err) // datos corruptos en Redis
+	}
+	if !conocida {
+		return nil, status.Errorf(codes.InvalidArgument, "merchant_category desconocida: %q", req.MerchantCategory)
 	}
 
 	// 1. Blacklist.
@@ -125,25 +154,45 @@ func (s *fraudEngineServer) EvaluateTransaction(ctx context.Context, req *pb.Tra
 		return rechazar(motivoViajeImposible), nil
 	}
 
+	// --- Fase opcional (O_i) ---
+	// D_rem se recalcula ACÁ: lo que importa es cuánto queda ahora, con la
+	// mandatoria y el viaje a Redis ya pagados.
+	dRem := time.Until(deadline)
+	var riskScore float64
+	degradada := !presupuesto.CorreOpcional(dRem)
+
+	if degradada {
+		// Sin slack: se responde solo con la mandatoria. Se acepta el riesgo
+		// de no haber corrido el scoring a cambio de cumplir el deadline.
+		log.Printf("tx_id=%s DEGRADADA: quedan %v, slack %v", req.TxId, dRem, presupuesto.Slack(dRem))
+	} else {
+		riskScore = opcional.Puntuar(req.Amount, stats, iteracionesScoring)
+		if riskScore > opcional.UmbralRechazo {
+			log.Printf("tx_id=%s FRAUDE %s: score %.3f", req.TxId, motivoRiesgoAlto, riskScore)
+			resp := rechazar(motivoRiesgoAlto)
+			resp.RiskScore = riskScore
+			return resp, nil
+		}
+	}
+
 	// Aprobada: recién ahora esta posición pasa a ser confiable (viaje 2 a
-	// Redis, solo para aprobadas). Si no se puede guardar, no se aprueba:
-	// la próxima transacción de esta tarjeta se compararía contra una
-	// posición vieja y el chequeo de viaje imposible quedaría debilitado.
+	// Redis, solo para aprobadas). Va DESPUÉS de la opcional: un rechazo por
+	// riesgo tampoco puede mover la tarjeta. Si no se puede guardar, no se
+	// aprueba: la próxima transacción de esta tarjeta se compararía contra
+	// una posición vieja y el chequeo de viaje imposible quedaría debilitado.
 	if err := v.ActualizarPosicion(ctx, req.CardToken, req.Latitude, req.Longitude, ahora); err != nil {
 		return nil, fallaDeVerificacion(req.TxId, err)
 	}
 
-	// TODO(etapa 4): slack time — decidir si corre la fase opcional
-	// (scoring de riesgo). Hasta entonces, la respuesta es solo M_i.
-
-	log.Printf("tx_id=%s card=%s amount=%.2f -> APROBADA", req.TxId, req.CardToken, req.Amount)
+	log.Printf("tx_id=%s card=%s amount=%.2f score=%.3f degradada=%v -> APROBADA",
+		req.TxId, req.CardToken, req.Amount, riskScore, degradada)
 
 	return &pb.EvaluationResponse{
 		TxId:             req.TxId,
 		IsFraud:          false,
 		RejectionReason:  "",
-		RiskScore:        0.0,
-		IsDegraded:       false,
+		RiskScore:        riskScore,
+		IsDegraded:       degradada,
 		ProcessingTimeMs: time.Since(start).Milliseconds(),
 	}, nil
 }

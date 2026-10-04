@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"fd_rts/internal/mandatoria"
+	"fd_rts/internal/opcional"
 	pb "fd_rts/proto"
 )
 
@@ -20,9 +22,18 @@ const (
 	moscuLat, moscuLon = 55.7558, 37.6173
 )
 
-// txValida arma una request completa: con tarjeta y coordenadas.
+// catPrueba tiene estadísticas cargadas en nuevoServerDePrueba: mediana de
+// $100 (media_log = ln 100), desvío 1 en log, riesgo promedio (peso 1).
+// Así, monto = 100·e^z da exactamente ese z, y $100 da z = 0 (score 0).
+const catPrueba = "test_cat"
+
+// montoConZ devuelve el monto que en catPrueba da exactamente ese z.
+func montoConZ(z float64) float64 { return 100 * math.Exp(z) }
+
+// txValida arma una request completa: con tarjeta, coordenadas, categoría
+// conocida y un monto típico ($100, z = 0).
 func txValida(txID, card string, lat, lon float64) *pb.TransactionRequest {
-	return &pb.TransactionRequest{TxId: txID, CardToken: card, Latitude: lat, Longitude: lon, Amount: 100}
+	return &pb.TransactionRequest{TxId: txID, CardToken: card, Latitude: lat, Longitude: lon, Amount: 100, MerchantCategory: catPrueba}
 }
 
 // nuevoServerDePrueba arma el server contra el Redis REAL, con un prefijo de
@@ -55,6 +66,12 @@ func nuevoServerDePrueba(t *testing.T) *fraudEngineServer {
 	v := mandatoria.NuevoVerificador(rdb, prefijo)
 	if err := v.Bloquear(ctx, "tok-robada"); err != nil {
 		t.Fatalf("Bloquear: %v", err)
+	}
+	err := v.GuardarEstadisticas(ctx, catPrueba, map[string]any{
+		opcional.CampoMediaLog: math.Log(100), opcional.CampoDesvioLog: 1.0, opcional.CampoPeso: 1.0,
+	})
+	if err != nil {
+		t.Fatalf("GuardarEstadisticas: %v", err)
 	}
 	return &fraudEngineServer{verificador: v}
 }
@@ -111,7 +128,13 @@ func TestControlDeAdmision(t *testing.T) {
 // evaluar llama al handler con el deadline normal de 200ms.
 func evaluar(t *testing.T, s *fraudEngineServer, req *pb.TransactionRequest) (*pb.EvaluationResponse, error) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	return evaluarCon(t, s, req, 200*time.Millisecond)
+}
+
+// evaluarCon es evaluar con un deadline a elección.
+func evaluarCon(t *testing.T, s *fraudEngineServer, req *pb.TransactionRequest, timeout time.Duration) (*pb.EvaluationResponse, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	return s.EvaluateTransaction(ctx, req)
 }
@@ -125,6 +148,12 @@ func TestRequestInvalida(t *testing.T) {
 		{"sin card_token", txValida("t1", "", baLat, baLon)},
 		{"sin coordenadas (0, 0)", txValida("t1", "tok-ok", 0, 0)},
 		{"latitud fuera de rango", txValida("t1", "tok-ok", 95, baLon)},
+		{"monto 0", conMonto(txValida("t1", "tok-ok", baLat, baLon), 0)},
+		{"monto negativo", conMonto(txValida("t1", "tok-ok", baLat, baLon), -10)},
+		{"monto NaN", conMonto(txValida("t1", "tok-ok", baLat, baLon), math.NaN())},
+		{"sin categoría", conCategoria(txValida("t1", "tok-ok", baLat, baLon), "")},
+		// Esta se detecta recién después del viaje 1 a Redis.
+		{"categoría desconocida", conCategoria(txValida("t1", "tok-ok", baLat, baLon), "no_existe")},
 	}
 	for _, c := range casos {
 		t.Run(c.nombre, func(t *testing.T) {
@@ -220,5 +249,87 @@ func TestRedisCaidoEsFailClosed(t *testing.T) {
 	// "Rápido" relativo al deadline: un décimo de los 200ms.
 	if tardo > 20*time.Millisecond {
 		t.Errorf("tardó %v en fallar: se esperaba fallo rápido, no quemar el deadline", tardo)
+	}
+}
+
+// conMonto devuelve la misma request con otro monto.
+func conMonto(req *pb.TransactionRequest, monto float64) *pb.TransactionRequest {
+	req.Amount = monto
+	return req
+}
+
+// conCategoria devuelve la misma request con otra categoría.
+func conCategoria(req *pb.TransactionRequest, cat string) *pb.TransactionRequest {
+	req.MerchantCategory = cat
+	return req
+}
+
+// La fase opcional corre o no según el slack, que depende del deadline con
+// el que llega la request. En catPrueba: $100 → z = 0 → score 0, y
+// 100·e^4 → z = 4 → score 1 − 0.25^(16/9) ≈ 0.915 (> 0.75).
+func TestFaseOpcional(t *testing.T) {
+	casos := []struct {
+		nombre       string
+		timeout      time.Duration
+		monto        float64
+		wantFraude   bool
+		wantMotivo   string
+		wantDegradad bool
+		wantScore    float64
+	}{
+		{"200ms, monto típico: corre la opcional y aprueba", 200 * time.Millisecond, montoConZ(0), false, "", false, 0},
+		{"200ms, monto anormalmente alto: RIESGO_ALTO", 200 * time.Millisecond, montoConZ(4), true, motivoRiesgoAlto, false, 1 - math.Pow(0.25, 16.0/9)},
+		// z² mira para los dos lados: card testing con cargas chiquitas.
+		{"200ms, monto anormalmente bajo: RIESGO_ALTO", 200 * time.Millisecond, montoConZ(-4), true, motivoRiesgoAlto, false, 1 - math.Pow(0.25, 16.0/9)},
+		// D_rem ≈ 99ms tras la mandatoria: slack ≈ 4ms ≥ 0, entra justo.
+		{"100ms: slack positivo, corre", 100 * time.Millisecond, montoConZ(0), false, "", false, 0},
+		// Pasa la admisión (≥ 35ms) pero no hay slack para la opcional.
+		// Monto anormal y aprobada igual: degradar es aceptar ese riesgo a
+		// cambio de cumplir el deadline.
+		{"60ms, monto anormalmente alto: degradada y aprobada", 60 * time.Millisecond, montoConZ(4), false, "", true, 0},
+	}
+
+	for _, c := range casos {
+		t.Run(c.nombre, func(t *testing.T) {
+			s := nuevoServerDePrueba(t)
+			inicio := time.Now()
+			resp, err := evaluarCon(t, s, conMonto(txValida("t1", "tok-ok", baLat, baLon), c.monto), c.timeout)
+			tardo := time.Since(inicio)
+			if err != nil {
+				t.Fatalf("error inesperado: %v", err)
+			}
+			if resp.IsFraud != c.wantFraude || resp.RejectionReason != c.wantMotivo || resp.IsDegraded != c.wantDegradad {
+				t.Errorf("is_fraud=%v motivo=%q degradada=%v, se esperaba is_fraud=%v motivo=%q degradada=%v",
+					resp.IsFraud, resp.RejectionReason, resp.IsDegraded, c.wantFraude, c.wantMotivo, c.wantDegradad)
+			}
+			if math.Abs(resp.RiskScore-c.wantScore) > 1e-9 {
+				t.Errorf("risk_score = %v, se esperaba %v", resp.RiskScore, c.wantScore)
+			}
+			// El punto de todo el mecanismo: responder antes del deadline.
+			if tardo > c.timeout {
+				t.Errorf("tardó %v, más que el deadline de %v", tardo, c.timeout)
+			}
+		})
+	}
+}
+
+// Un rechazo por riesgo alto tampoco mueve la tarjeta: si la posición se
+// guardara antes de la opcional, la compra siguiente desde Moscú se
+// compararía contra BA y daría viaje imposible.
+func TestRechazoPorRiesgoNoMueveLaTarjeta(t *testing.T) {
+	s := nuevoServerDePrueba(t)
+
+	r1, err := evaluar(t, s, conMonto(txValida("t1", "tok-ok", baLat, baLon), montoConZ(4)))
+	if err != nil || r1.RejectionReason != motivoRiesgoAlto {
+		t.Fatalf("t1: se esperaba RIESGO_ALTO, llegó %+v (err=%v)", r1, err)
+	}
+
+	// Sin posición confiable previa, Moscú no tiene con qué compararse.
+	r2, err := evaluar(t, s, txValida("t2", "tok-ok", moscuLat, moscuLon))
+	if err != nil {
+		t.Fatalf("t2: error inesperado: %v", err)
+	}
+	if r2.IsFraud {
+		t.Errorf("t2: rechazada por %q: la posición del rechazo por riesgo se guardó", r2.RejectionReason)
 	}
 }

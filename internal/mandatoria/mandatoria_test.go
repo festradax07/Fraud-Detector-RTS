@@ -63,7 +63,7 @@ func consultar(t *testing.T, v *Verificador, card string, lat, lon float64, ahor
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	res, err := v.Consultar(ctx, nuevoTxID(), card, lat, lon, ahora)
+	res, err := v.Consultar(ctx, nuevoTxID(), card, "test_cat", lat, lon, ahora)
 	if err != nil {
 		t.Fatalf("Consultar: error inesperado: %v", err)
 	}
@@ -177,7 +177,7 @@ func TestTxIDRepetidoNoSumaIntentos(t *testing.T) {
 	v := verificadorDePrueba(t)
 	ctx := context.Background()
 	for i := 0; i < 3; i++ {
-		res, err := v.Consultar(ctx, "tx-reintentada", "tok-a", baLat, baLon, inicio.Add(time.Duration(i)*time.Second))
+		res, err := v.Consultar(ctx, "tx-reintentada", "tok-a", "test_cat", baLat, baLon, inicio.Add(time.Duration(i)*time.Second))
 		if err != nil {
 			t.Fatalf("Consultar: %v", err)
 		}
@@ -201,7 +201,7 @@ func TestVelocidadConcurrente(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			// t.Errorf es seguro desde varias goroutines; t.Fatalf no.
-			if _, err := v.Consultar(context.Background(), nuevoTxID(), "tok-a", baLat, baLon, inicio); err != nil {
+			if _, err := v.Consultar(context.Background(), nuevoTxID(), "tok-a", "test_cat", baLat, baLon, inicio); err != nil {
 				t.Errorf("Consultar: %v", err)
 			}
 		}()
@@ -264,11 +264,29 @@ func TestPosicion(t *testing.T) {
 	t.Run("posición corrupta en Redis: error, no se ignora", func(t *testing.T) {
 		v := verificadorDePrueba(t)
 		v.rdb.Set(ctx, v.clavePosicion("tok-a"), "basura", 0)
-		_, err := v.Consultar(ctx, nuevoTxID(), "tok-a", baLat, baLon, inicio)
+		_, err := v.Consultar(ctx, nuevoTxID(), "tok-a", "test_cat", baLat, baLon, inicio)
 		if err == nil {
 			t.Errorf("se esperaba error con una posición corrupta")
 		}
 	})
+}
+
+// Las estadísticas de la categoría viajan en el mismo pipeline.
+func TestEstadisticasEnElViaje1(t *testing.T) {
+	v := verificadorDePrueba(t)
+	ctx := context.Background()
+
+	if res := consultar(t, v, "tok-a", baLat, baLon, inicio); len(res.StatsCategoria) != 0 {
+		t.Errorf("categoría sin cargar: StatsCategoria = %v, se esperaba vacío", res.StatsCategoria)
+	}
+
+	if err := v.GuardarEstadisticas(ctx, "test_cat", map[string]any{"media_log": 4.6, "desvio_log": 0.45, "peso": 2.44}); err != nil {
+		t.Fatalf("GuardarEstadisticas: %v", err)
+	}
+	res := consultar(t, v, "tok-a", baLat, baLon, inicio)
+	if res.StatsCategoria["media_log"] != "4.6" || res.StatsCategoria["peso"] != "2.44" {
+		t.Errorf("StatsCategoria = %v", res.StatsCategoria)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -284,7 +302,7 @@ func TestRedisCaido(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	t0 := time.Now()
-	_, err := v.Consultar(ctx, nuevoTxID(), "tok-a", baLat, baLon, inicio)
+	_, err := v.Consultar(ctx, nuevoTxID(), "tok-a", "test_cat", baLat, baLon, inicio)
 	tardo := time.Since(t0)
 	if err == nil {
 		t.Errorf("se esperaba error con Redis caído: sin verificar no se aprueba")
@@ -304,7 +322,7 @@ func TestDeadlineLlegaARedis(t *testing.T) {
 	defer cancel()
 	time.Sleep(time.Millisecond) // asegurar que ya venció
 
-	_, err := v.Consultar(ctx, nuevoTxID(), "tok-a", baLat, baLon, inicio)
+	_, err := v.Consultar(ctx, nuevoTxID(), "tok-a", "test_cat", baLat, baLon, inicio)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("err = %v, se esperaba context.DeadlineExceeded", err)
 	}

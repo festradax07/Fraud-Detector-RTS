@@ -1,10 +1,15 @@
-.PHONY: build run-server proto clean
+.PHONY: build run-server cargar-stats proto clean
 
 build:
 	go build ./...
 
 run-server:
 	go run ./cmd/server
+
+# Estadísticas por categoría para el Z-score (fase opcional). Requiere el
+# dataset en data/ y Redis levantado.
+cargar-stats:
+	go run ./cmd/cargar-stats -csv data/fraudTrain.csv
 
 proto:
 	protoc \
