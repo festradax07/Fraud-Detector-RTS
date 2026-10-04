@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -23,10 +25,38 @@ func txValida(txID, card string, lat, lon float64) *pb.TransactionRequest {
 	return &pb.TransactionRequest{TxId: txID, CardToken: card, Latitude: lat, Longitude: lon, Amount: 100}
 }
 
-// nuevoServerDePrueba arma el server con un Verificador propio, para que
-// cada test arranque sin estado previo.
-func nuevoServerDePrueba() *fraudEngineServer {
-	return &fraudEngineServer{verificador: mandatoria.NuevoVerificador([]string{"tok-robada"})}
+// nuevoServerDePrueba arma el server contra el Redis REAL, con un prefijo de
+// claves único para que cada test arranque sin estado previo y no pise los
+// datos del server ("drts:"). Carga "tok-robada" en la blacklist y borra
+// todas sus claves al terminar.
+//
+// Si Redis no está levantado, el test FALLA (no se saltea).
+func nuevoServerDePrueba(t *testing.T) *fraudEngineServer {
+	t.Helper()
+	rdb := mandatoria.NuevoClienteRedis(redisAddr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		rdb.Close()
+		t.Fatalf("Redis no disponible en %s (levantalo con: docker start redis-drts): %v", redisAddr, err)
+	}
+
+	prefijo := fmt.Sprintf("test:%d:%d:", os.Getpid(), time.Now().UnixNano())
+	t.Cleanup(func() {
+		ctx := context.Background()
+		iter := rdb.Scan(ctx, 0, prefijo+"*", 100).Iterator()
+		for iter.Next(ctx) {
+			rdb.Del(ctx, iter.Val())
+		}
+		rdb.Close()
+	})
+
+	v := mandatoria.NuevoVerificador(rdb, prefijo)
+	if err := v.Bloquear(ctx, "tok-robada"); err != nil {
+		t.Fatalf("Bloquear: %v", err)
+	}
+	return &fraudEngineServer{verificador: v}
 }
 
 // TestControlDeAdmision llama al handler directamente (sin red) con distintos
@@ -48,7 +78,7 @@ func TestControlDeAdmision(t *testing.T) {
 		{"200ms, el caso normal", 200 * time.Millisecond, codes.OK},
 	}
 
-	s := nuevoServerDePrueba()
+	s := nuevoServerDePrueba(t)
 
 	for _, c := range casos {
 		t.Run(c.nombre, func(t *testing.T) {
@@ -91,13 +121,14 @@ func TestRequestInvalida(t *testing.T) {
 		nombre string
 		req    *pb.TransactionRequest
 	}{
+		{"sin tx_id", txValida("", "tok-ok", baLat, baLon)},
 		{"sin card_token", txValida("t1", "", baLat, baLon)},
 		{"sin coordenadas (0, 0)", txValida("t1", "tok-ok", 0, 0)},
 		{"latitud fuera de rango", txValida("t1", "tok-ok", 95, baLon)},
 	}
 	for _, c := range casos {
 		t.Run(c.nombre, func(t *testing.T) {
-			_, err := evaluar(t, nuevoServerDePrueba(), c.req)
+			_, err := evaluar(t, nuevoServerDePrueba(t), c.req)
 			if got := status.Code(err); got != codes.InvalidArgument {
 				t.Errorf("código = %v, se esperaba InvalidArgument (err=%v)", got, err)
 			}
@@ -150,7 +181,7 @@ func TestFaseMandatoria(t *testing.T) {
 
 	for _, e := range escenarios {
 		t.Run(e.nombre, func(t *testing.T) {
-			s := nuevoServerDePrueba()
+			s := nuevoServerDePrueba(t)
 			for i, p := range e.pasos {
 				resp, err := evaluar(t, s, p.req)
 				if err != nil {
@@ -163,5 +194,31 @@ func TestFaseMandatoria(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Redis caído en el hot path: fail-closed. No se aprueba (ni se marca como
+// fraude): el motor no pudo decidir y lo dice con un error gRPC.
+func TestRedisCaidoEsFailClosed(t *testing.T) {
+	// Puerto donde no hay nadie escuchando: simula Redis caído.
+	rdb := mandatoria.NuevoClienteRedis("localhost:1")
+	defer rdb.Close()
+	s := &fraudEngineServer{verificador: mandatoria.NuevoVerificador(rdb, "test:")}
+
+	inicio := time.Now()
+	resp, err := evaluar(t, s, txValida("t1", "tok-ok", baLat, baLon))
+	tardo := time.Since(inicio)
+
+	if resp != nil {
+		t.Errorf("se esperaba sin respuesta, llegó %+v", resp)
+	}
+	// Sin reintentos, Redis caído es Unavailable, no DeadlineExceeded: se
+	// rechaza al instante en vez de esperar a que venza el deadline.
+	if got := status.Code(err); got != codes.Unavailable {
+		t.Errorf("código = %v, se esperaba Unavailable (err=%v)", got, err)
+	}
+	// "Rápido" relativo al deadline: un décimo de los 200ms.
+	if tardo > 20*time.Millisecond {
+		t.Errorf("tardó %v en fallar: se esperaba fallo rápido, no quemar el deadline", tardo)
 	}
 }

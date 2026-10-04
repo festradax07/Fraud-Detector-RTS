@@ -1,13 +1,12 @@
-// Fraud-Engine — esqueleto inicial.
-//
-// Por ahora este server no implementa nada del mecanismo real (fase
-// mandatoria, control de admisión, slack time). Es solo un servidor gRPC
-// que compila, levanta, y responde algo fijo — el punto de partida para ir
-// agregando cada pieza por separado y entender qué hace cada una.
+// Fraud-Engine: decide si una transacción se aprueba o rechaza bajo un
+// deadline duro de 200ms. Hoy implementa el control de admisión (Etapa 1) y
+// la fase mandatoria (Etapa 2). La fase opcional y el slack time llegan en
+// la Etapa 4.
 package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net"
 	"time"
@@ -34,6 +33,10 @@ const (
 // ~35ms es un PUNTO DE PARTIDA de diseño, no un resultado medido: se
 // recalibra midiendo en esta máquina (Etapa 10).
 const minBudget = 35 * time.Millisecond
+
+// redisAddr es fijo por ahora. En la Etapa 7.5 pasa a una variable de
+// entorno (REDIS_ADDR).
+const redisAddr = "localhost:6379"
 
 type fraudEngineServer struct {
 	pb.UnimplementedFraudEngineServer
@@ -65,6 +68,12 @@ func (s *fraudEngineServer) EvaluateTransaction(ctx context.Context, req *pb.Tra
 
 	// Validación de la request: sin tarjeta o sin coordenadas no hay con qué
 	// evaluar. Es un error del cliente (InvalidArgument), no un fraude.
+	//
+	// tx_id es obligatorio desde la Etapa 3: es el miembro del ZSET de
+	// velocidad, y vacío haría que todos esos intentos se fundieran en uno.
+	if req.TxId == "" {
+		return nil, status.Error(codes.InvalidArgument, "falta tx_id")
+	}
 	if req.CardToken == "" {
 		return nil, status.Error(codes.InvalidArgument, "falta card_token")
 	}
@@ -89,31 +98,40 @@ func (s *fraudEngineServer) EvaluateTransaction(ctx context.Context, req *pb.Tra
 	v := s.verificador
 	ahora := start
 
-	// Se registra ANTES de cualquier rechazo: el control de velocidad cuenta
-	// todos los intentos, también los que después se rechazan.
-	intentos := v.RegistrarIntento(req.CardToken, ahora)
+	// Viaje 1 a Redis: registra el intento (ANTES de cualquier rechazo: la
+	// velocidad cuenta todos los intentos) y trae blacklist, intentos y
+	// posición previa, todo junto. Va con el ctx de la request: el deadline
+	// del cliente llega hasta Redis.
+	res, err := v.Consultar(ctx, req.TxId, req.CardToken, req.Latitude, req.Longitude, ahora)
+	if err != nil {
+		return nil, fallaDeVerificacion(req.TxId, err)
+	}
 
-	// 1. Blacklist: el más barato, va primero.
-	if v.EnBlacklist(req.CardToken) {
+	// 1. Blacklist.
+	if res.EnBlacklist {
 		log.Printf("tx_id=%s FRAUDE %s", req.TxId, motivoBlacklist)
 		return rechazar(motivoBlacklist), nil
 	}
 
 	// 2. Control de velocidad (card testing).
-	if intentos > mandatoria.MaxIntentos {
-		log.Printf("tx_id=%s FRAUDE %s: %d intentos en %v", req.TxId, motivoCardTesting, intentos, mandatoria.VentanaVelocidad)
+	if res.Intentos > mandatoria.MaxIntentos {
+		log.Printf("tx_id=%s FRAUDE %s: %d intentos en %v", req.TxId, motivoCardTesting, res.Intentos, mandatoria.VentanaVelocidad)
 		return rechazar(motivoCardTesting), nil
 	}
 
 	// 3. Viaje imposible.
-	kmh, hayPrevia := v.VelocidadDesdeUltima(req.CardToken, req.Latitude, req.Longitude, ahora)
-	if hayPrevia && kmh > mandatoria.VelocidadMaxKmh {
-		log.Printf("tx_id=%s FRAUDE %s: %.0f km/h", req.TxId, motivoViajeImposible, kmh)
+	if res.HayPrevia && res.Kmh > mandatoria.VelocidadMaxKmh {
+		log.Printf("tx_id=%s FRAUDE %s: %.0f km/h", req.TxId, motivoViajeImposible, res.Kmh)
 		return rechazar(motivoViajeImposible), nil
 	}
 
-	// Aprobada: recién ahora esta posición pasa a ser confiable.
-	v.ActualizarPosicion(req.CardToken, req.Latitude, req.Longitude, ahora)
+	// Aprobada: recién ahora esta posición pasa a ser confiable (viaje 2 a
+	// Redis, solo para aprobadas). Si no se puede guardar, no se aprueba:
+	// la próxima transacción de esta tarjeta se compararía contra una
+	// posición vieja y el chequeo de viaje imposible quedaría debilitado.
+	if err := v.ActualizarPosicion(ctx, req.CardToken, req.Latitude, req.Longitude, ahora); err != nil {
+		return nil, fallaDeVerificacion(req.TxId, err)
+	}
 
 	// TODO(etapa 4): slack time — decidir si corre la fase opcional
 	// (scoring de riesgo). Hasta entonces, la respuesta es solo M_i.
@@ -130,7 +148,39 @@ func (s *fraudEngineServer) EvaluateTransaction(ctx context.Context, req *pb.Tra
 	}, nil
 }
 
+// fallaDeVerificacion traduce un error de Redis a un código gRPC. En los
+// dos casos es fail-closed: no se aprueba lo que no se pudo verificar. No es
+// un fraude (is_fraud): es que el motor NO PUDO decidir.
+func fallaDeVerificacion(txID string, err error) error {
+	log.Printf("tx_id=%s SIN VERIFICAR: %v", txID, err)
+	// Se acabó el deadline de la request mientras esperábamos a Redis.
+	if errors.Is(err, context.DeadlineExceeded) {
+		return status.Error(codes.DeadlineExceeded, "se agotó el deadline verificando la transacción")
+	}
+	// Redis caído o inalcanzable.
+	return status.Error(codes.Unavailable, "no se pudo verificar la transacción")
+}
+
 func main() {
+	// Cliente de Redis (configuración del hot path: respeta el deadline del
+	// ctx y no reintenta; ver mandatoria.NuevoClienteRedis).
+	rdb := mandatoria.NuevoClienteRedis(redisAddr)
+	defer rdb.Close()
+
+	// PING al arrancar: si Redis no está, el server no arranca. Fail-closed
+	// desde el inicio: mejor no atender que atender sin poder verificar.
+	//
+	// Acá SÍ va context.Background(): esto no es el hot path, no hay
+	// request entrante de la que heredar un deadline. Le ponemos uno propio
+	// para no quedarnos colgados si Redis no responde.
+	ctxPing, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	err := rdb.Ping(ctxPing).Err()
+	cancel()
+	if err != nil {
+		log.Fatalf("no pude conectar a Redis en %s: %v", redisAddr, err)
+	}
+	log.Printf("conectado a Redis en %s", redisAddr)
+
 	addr := ":50051"
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -138,9 +188,9 @@ func main() {
 	}
 
 	grpcServer := grpc.NewServer()
-	// Blacklist de ejemplo, fija en el código. En la Etapa 3 pasa a ser un
-	// SET en Redis.
-	verificador := mandatoria.NuevoVerificador([]string{"tok-robada"})
+	// La blacklist ya no está en el código: es el SET drts:blacklist en
+	// Redis (se carga con SADD, ver docs/GUIA-GO.md).
+	verificador := mandatoria.NuevoVerificador(rdb, "drts:")
 	pb.RegisterFraudEngineServer(grpcServer, &fraudEngineServer{verificador: verificador})
 
 	log.Printf("fraud-engine escuchando en %s", addr)
