@@ -21,6 +21,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
+	"fd_rts/internal/config"
 	"fd_rts/internal/fallas"
 	"fd_rts/internal/mandatoria"
 	"fd_rts/internal/metricas"
@@ -71,6 +72,10 @@ func (s settlementLento) CommitTransaction(ctx context.Context, req *pb.Settleme
 	return s.Servidor.CommitTransaction(ctx, req)
 }
 
+// redisAddrTest: el Redis real de los tests. REDIS_ADDR permite apuntar a
+// otro (por ejemplo, desde un contenedor, donde Redis no está en localhost).
+var redisAddrTest = config.Texto("REDIS_ADDR", redisAddrPorDefecto)
+
 // Coordenadas de referencia para los tests.
 const (
 	baLat, baLon       = -34.6037, -58.3816
@@ -108,13 +113,13 @@ func nuevoServerDePrueba(t *testing.T) *fraudEngineServer {
 // sobre los mismos datos.
 func nuevoServerConRedis(t *testing.T) (*fraudEngineServer, *redis.Client, string) {
 	t.Helper()
-	rdb := redisclient.Nuevo(redisAddr)
+	rdb := redisclient.Nuevo(redisAddrTest)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		rdb.Close()
-		t.Fatalf("Redis no disponible en %s (levantalo con: docker start redis-drts): %v", redisAddr, err)
+		t.Fatalf("Redis no disponible en %s (levantalo con: docker start redis-drts): %v", redisAddrTest, err)
 	}
 
 	prefijo := fmt.Sprintf("test:%d:%d:", os.Getpid(), time.Now().UnixNano())
@@ -139,7 +144,11 @@ func nuevoServerConRedis(t *testing.T) (*fraudEngineServer, *redis.Client, strin
 	if err != nil {
 		t.Fatalf("GuardarEstadisticas: %v", err)
 	}
-	return &fraudEngineServer{verificador: v, settle: levantarSettlement(t, settlement.NuevoServidor(rdb, prefijo))}, rdb, prefijo
+	return &fraudEngineServer{
+		verificador: v,
+		settle:      levantarSettlement(t, settlement.NuevoServidor(rdb, prefijo)),
+		iteraciones: iteracionesPorDefecto,
+	}, rdb, prefijo
 }
 
 // TestControlDeAdmision llama al handler directamente (sin red) con distintos
@@ -421,7 +430,7 @@ func estadoRegistrado(t *testing.T, s *fraudEngineServer, txID string) string {
 	t.Helper()
 	// El server de prueba y su Settlement comparten Redis y prefijo; el
 	// prefijo se recupera de una clave conocida del Verificador.
-	rdb := redisclient.Nuevo(redisAddr)
+	rdb := redisclient.Nuevo(redisAddrTest)
 	defer rdb.Close()
 	claves, err := rdb.Keys(context.Background(), "test:*:settle:"+txID).Result()
 	if err != nil {
@@ -482,7 +491,7 @@ func TestSettlementFalla(t *testing.T) {
 		// Tarda 100ms: el timeout propio (ReservaSettleNet = 15ms) corta
 		// mucho antes que el deadline del cliente.
 		{"Settlement lento", func(t *testing.T, s *fraudEngineServer) pb.SettlementClient {
-			rdb := redisclient.Nuevo(redisAddr)
+			rdb := redisclient.Nuevo(redisAddrTest)
 			t.Cleanup(func() { rdb.Close() })
 			return levantarSettlement(t, settlementLento{settlement.NuevoServidor(rdb, "test:lento:"), 100 * time.Millisecond})
 		}, codes.DeadlineExceeded, presupuesto.ReservaSettleNet + 10*time.Millisecond},
@@ -599,7 +608,7 @@ func TestMotivosDeError(t *testing.T) {
 		{"categoría desconocida", nil, conCategoria(txValida("t1", "tok-ok", baLat, baLon), "no_existe"), 200 * time.Millisecond, codes.InvalidArgument, fallas.CategoriaDesconocida},
 		// Mismo código que el early drop, otro motivo: este es AMBIGUO.
 		{"settlement lento", func(t *testing.T, s *fraudEngineServer) {
-			rdb := redisclient.Nuevo(redisAddr)
+			rdb := redisclient.Nuevo(redisAddrTest)
 			t.Cleanup(func() { rdb.Close() })
 			s.settle = levantarSettlement(t, settlementLento{settlement.NuevoServidor(rdb, "test:lento:"), 100 * time.Millisecond})
 		}, txValida("t1", "tok-ok", baLat, baLon), 90 * time.Millisecond, codes.DeadlineExceeded, fallas.SettlementTimeout},

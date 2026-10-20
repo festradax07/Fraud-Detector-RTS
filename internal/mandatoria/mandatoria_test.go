@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"fd_rts/internal/config"
 	"fd_rts/internal/redisclient"
 )
 
@@ -18,7 +19,7 @@ import (
 // Helpers: Redis real
 // ---------------------------------------------------------------------------
 
-const redisAddrTest = "localhost:6379"
+var redisAddrTest = config.Texto("REDIS_ADDR", "localhost:6379") // REDIS_ADDR: para correr los tests desde un contenedor
 
 // verificadorDePrueba conecta al Redis REAL y usa un prefijo de claves único,
 // para que el test no pise datos del server ni de otros tests. Al terminar,

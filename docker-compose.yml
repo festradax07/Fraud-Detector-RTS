@@ -1,17 +1,110 @@
-# Observabilidad del D-RTS (Etapa 7): Prometheus + Grafana, ya provisionados.
+# D-RTS en Docker Compose (Etapa 7.5). Tres grupos, con perfiles:
 #
-#   docker compose up -d       # levantar
-#   docker compose down        # bajar (los datos de Prometheus quedan en un volumen)
+#   docker compose up -d                          # solo observabilidad
+#   docker compose --profile sistema up -d --build   # + Redis, Settlement, Fraud-Engine
+#   docker compose --profile sistema --profile carga run --rm loadgen -rps 300 -duracion 30s
+#   (los dos perfiles: el loadgen depende del engine, que está en "sistema")
 #
-# Grafana: http://localhost:3000 (sin login, el dashboard es la página de inicio)
-# Prometheus: http://localhost:9090
+# (o los atajos del Makefile: obs-up, sistema-up, carga-compose, sistema-down)
 #
-# Los servicios del D-RTS (Fraud-Engine, Settlement, loadgen) corren en el
-# HOST, no acá: Prometheus los scrapea vía host.docker.internal. Meterlos en
-# contenedores es la Etapa 7.5. Redis corre aparte (contenedor redis-drts).
-name: drts-observabilidad
+# Grafana: http://localhost:3000 (sin login). Prometheus: http://localhost:9090.
+#
+# Prometheus scrapea las DOS formas de correr el sistema, con la etiqueta
+# entorno: "nativo" (binarios en el host) y "compose" (este archivo). Así
+# el mismo dashboard sirve para compararlas (ADR-0018).
+name: drts
+
+# Las mismas imágenes en todos los entornos: se construyen desde el mismo
+# Dockerfile, eligiendo la etapa final con target.
+x-build: &build
+  context: .
+  dockerfile: Dockerfile
 
 services:
+  # ---------------------------------------------------------------- sistema
+  redis:
+    profiles: [sistema]
+    image: redis:8.10.2
+    # Sin snapshots a disco: un snapshot hace fork() del proceso, que puede
+    # frenar a Redis justo en medio de una medición. Los datos se recargan
+    # solos (cargar-stats), no hace falta persistirlos.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+    # Sin puerto publicado: solo se lo usa desde la red interna. (Así no
+    # choca con el redis-drts del entorno nativo, que usa el 6379 del host.)
+
+  # Corre una vez y termina: carga las estadísticas del Z-score en Redis.
+  cargar-stats:
+    profiles: [sistema]
+    build: { <<: *build, target: cargar-stats }
+    image: drts/cargar-stats:dev
+    command: ["-csv", "/app/data/fraudTrain.csv", "-redis", "redis:6379"]
+    volumes:
+      - ./data:/app/data:ro # el dataset NO va en la imagen
+    depends_on:
+      redis: { condition: service_healthy }
+
+  settlement:
+    profiles: [sistema]
+    build: { <<: *build, target: settlement }
+    image: drts/settlement:dev
+    environment:
+      REDIS_ADDR: redis:6379
+    healthcheck:
+      # No hay shell en la imagen: el chequeo es el binario /salud (gRPC).
+      test: ["CMD", "/salud", "-addr", "localhost:50052"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 5s
+    depends_on:
+      redis: { condition: service_healthy }
+
+  fraud-engine:
+    profiles: [sistema]
+    build: { <<: *build, target: fraud-engine }
+    image: drts/fraud-engine:dev
+    environment:
+      REDIS_ADDR: redis:6379
+      SETTLEMENT_ADDR: settlement:50052
+      # ITERACIONES_SCORING: 10000000   # perilla de costo (default)
+    healthcheck:
+      test: ["CMD", "/salud", "-addr", "localhost:50051"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 5s
+    depends_on:
+      settlement: { condition: service_healthy }
+      # Sin estadísticas, toda transacción es "categoría desconocida".
+      cargar-stats: { condition: service_completed_successfully }
+    # Sin límites de CPU/memoria por ahora: para comparar contra nativo en
+    # igualdad de condiciones. Los límites (y el throttling que generan) se
+    # estudian en la Etapa 10.
+
+  # ------------------------------------------------------------------ carga
+  loadgen:
+    profiles: [carga]
+    build: { <<: *build, target: loadgen }
+    image: drts/loadgen:dev
+    # El target va fijo en el entrypoint; los argumentos de "run" reemplazan
+    # solo al command (ver el ejemplo de arriba, con los dos perfiles)
+    entrypoint: ["/loadgen", "-target", "fraud-engine:50051"]
+    command: ["-modo", "nominal"]
+    # La imagen corre como uid 65532, que no puede escribir en ./resultados
+    # (es de tu usuario). Se corre con tu uid/gid.
+    user: "${DRTS_UID:-1000}:${DRTS_GID:-1000}"
+    volumes:
+      - ./data:/app/data:ro
+      - ./resultados:/app/resultados
+    depends_on:
+      fraud-engine: { condition: service_healthy }
+
+  # --------------------------------------------------------- observabilidad
   prometheus:
     image: prom/prometheus:v3.15.0 # versión fija: el entorno se levanta igual siempre
     command:
@@ -23,8 +116,9 @@ services:
     ports:
       - "127.0.0.1:9090:9090" # solo localhost: no exponer a la red
     extra_hosts:
-      # En Linux, host.docker.internal no existe por defecto: host-gateway
-      # lo resuelve a la IP del host vista desde el contenedor.
+      # Para scrapear el entorno nativo (servicios corriendo en el host). En
+      # Linux host.docker.internal no existe por defecto: host-gateway lo
+      # resuelve a la IP del host vista desde el contenedor.
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
 

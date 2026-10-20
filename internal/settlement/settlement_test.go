@@ -15,12 +15,13 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	"fd_rts/internal/config"
 	"fd_rts/internal/redisclient"
 	pb "fd_rts/proto"
 )
 
 // redisAddr del Redis real de desarrollo.
-const redisAddr = "localhost:6379"
+var redisAddr = config.Texto("REDIS_ADDR", "localhost:6379") // REDIS_ADDR: para correr los tests desde un contenedor
 
 // entorno es un Settlement real escuchando en un puerto TCP real, contra el
 // Redis real, con un cliente gRPC real apuntándole. Nada simulado.
