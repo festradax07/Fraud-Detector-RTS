@@ -10,7 +10,11 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
@@ -19,12 +23,14 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	"fd_rts/internal/config"
 	"fd_rts/internal/fallas"
 	"fd_rts/internal/mandatoria"
 	"fd_rts/internal/metricas"
 	"fd_rts/internal/opcional"
 	"fd_rts/internal/presupuesto"
 	"fd_rts/internal/redisclient"
+	"fd_rts/internal/servicio"
 	"fd_rts/internal/settlement"
 	pb "fd_rts/proto"
 )
@@ -39,23 +45,58 @@ const (
 	motivoRiesgoAlto     = "RIESGO_ALTO" // fase opcional: score > umbral
 )
 
-// iteracionesScoring fija el costo de CPU SIMULADO del scoring (el Z-score
-// real tarda ~40ns; esto simula un modelo más pesado). Medido en esta
-// máquina (Etapa 4): 10M ≈ 16ms de media, ≈ 19ms de máximo, cómodo dentro
-// de WCET(O) = 80ms. Es una perilla para las Etapas 6 y 10, no un valor del
-// modelo.
-const iteracionesScoring = 10_000_000
+// Configuración por variables de entorno (Etapa 7.5). Los valores por
+// defecto son los que se usaban fijos en el código hasta la Etapa 7.
+const (
+	// iteracionesPorDefecto fija el costo de CPU SIMULADO del scoring (el
+	// Z-score real tarda ~40ns; esto simula un modelo más pesado). Medido en
+	// esta máquina (Etapa 4): 10M ≈ 16ms de media, ≈ 19ms de máximo, cómodo
+	// dentro de WCET(O) = 80ms. Es una perilla para las Etapas 6 y 10, no un
+	// valor del modelo: por eso se puede cambiar por entorno
+	// (ITERACIONES_SCORING) sin recompilar.
+	iteracionesPorDefecto = 10_000_000
 
-// redisAddr es fijo por ahora. En la Etapa 7.5 pasa a una variable de
-// entorno (REDIS_ADDR).
-const redisAddr = "localhost:6379"
+	redisAddrPorDefecto = "localhost:6379"
+)
 
-// settlementAddr: dónde escucha Settlement (Etapa 5). Mismo criterio que
-// redisAddr: pasa a variable de entorno en la Etapa 7.5.
-const settlementAddr = "localhost:50052"
+// configuracion del Fraud-Engine, leída del entorno.
+type configuracion struct {
+	grpcAddr       string        // GRPC_ADDR: dónde escucha el servicio
+	metricasAddr   string        // METRICAS_ADDR: /metrics ("" = no exponer)
+	redisAddr      string        // REDIS_ADDR
+	settlementAddr string        // SETTLEMENT_ADDR
+	iteraciones    int           // ITERACIONES_SCORING: costo simulado del scoring
+	esperaApagado  time.Duration // APAGADO_ESPERA: máximo para drenar requests en vuelo
+	avisoApagado   time.Duration // APAGADO_AVISO: NOT_SERVING antes de dejar de atender
+}
 
-// metricasAddr: dónde se expone /metrics para Prometheus (Etapa 7).
-const metricasAddr = ":2112"
+func leerConfiguracion() (configuracion, error) {
+	c := configuracion{
+		grpcAddr:       config.Texto("GRPC_ADDR", ":50051"),
+		metricasAddr:   config.Texto("METRICAS_ADDR", ":2112"),
+		redisAddr:      config.Texto("REDIS_ADDR", redisAddrPorDefecto),
+		settlementAddr: config.Texto("SETTLEMENT_ADDR", "localhost:50052"),
+	}
+	var err error
+	if c.iteraciones, err = config.Entero("ITERACIONES_SCORING", iteracionesPorDefecto); err != nil {
+		return c, err
+	}
+	if c.iteraciones < 0 {
+		return c, fmt.Errorf("ITERACIONES_SCORING=%d: no puede ser negativo", c.iteraciones)
+	}
+	// 5s: las requests en vuelo terminan en < 200ms (el deadline), así que
+	// sobra; y queda por debajo de los plazos de los orquestadores antes del
+	// SIGKILL (10s en Compose, 30s por defecto en ECS).
+	if c.esperaApagado, err = config.Duracion("APAGADO_ESPERA", 5*time.Second); err != nil {
+		return c, err
+	}
+	// 0 en local (no hay balanceador que tenga que enterarse). Detrás de un
+	// balanceador, unos segundos (lo que tarde en ver el NOT_SERVING).
+	if c.avisoApagado, err = config.Duracion("APAGADO_AVISO", 0); err != nil {
+		return c, err
+	}
+	return c, nil
+}
 
 type fraudEngineServer struct {
 	pb.UnimplementedFraudEngineServer
@@ -63,6 +104,8 @@ type fraudEngineServer struct {
 	// settle es el cliente gRPC de Settlement: desde la Etapa 5 el
 	// Fraud-Engine es servidor (de los clientes) Y cliente (de Settlement).
 	settle pb.SettlementClient
+	// iteraciones de costo simulado del scoring (ITERACIONES_SCORING).
+	iteraciones int
 	// metricas del modelo temporal (Etapa 7). Puede ser nil: los métodos no
 	// hacen nada en ese caso.
 	metricas *metricas.Motor
@@ -194,7 +237,7 @@ func (s *fraudEngineServer) EvaluateTransaction(ctx context.Context, req *pb.Tra
 		log.Printf("tx_id=%s DEGRADADA: quedan %v, slack %v", req.TxId, dRem, presupuesto.Slack(dRem))
 	} else {
 		tOpcional := time.Now()
-		riskScore = opcional.Puntuar(req.Amount, stats, iteracionesScoring)
+		riskScore = opcional.Puntuar(req.Amount, stats, s.iteraciones)
 		s.metricas.Fase(metricas.FaseOpcional, time.Since(tOpcional))
 		if riskScore > opcional.UmbralRechazo {
 			log.Printf("tx_id=%s FRAUDE %s: score %.3f", req.TxId, motivoRiesgoAlto, riskScore)
@@ -348,9 +391,31 @@ func fallaDeVerificacion(txID string, err error) error {
 }
 
 func main() {
+	cfg, err := leerConfiguracion()
+	if err != nil {
+		// Mejor no arrancar que correr con una configuración que no es la
+		// que se pidió.
+		log.Fatalf("configuración inválida: %v", err)
+	}
+	log.Printf("configuración: grpc=%s metricas=%q redis=%s settlement=%s iteraciones=%d apagado=%v aviso=%v",
+		cfg.grpcAddr, cfg.metricasAddr, cfg.redisAddr, cfg.settlementAddr, cfg.iteraciones, cfg.esperaApagado, cfg.avisoApagado)
+
+	// Señal de apagado: SIGTERM (lo que manda un orquestador: Compose, ECS)
+	// o Ctrl+C. ctx se cancela cuando llega cualquiera de las dos.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		// Después de la primera señal se restaura el comportamiento normal:
+		// un segundo Ctrl+C mata el proceso en el acto.
+		stop()
+	}()
+
 	// Cliente de Redis (configuración del hot path: respeta el deadline del
-	// ctx y no reintenta; ver redisclient.Nuevo).
-	rdb := redisclient.Nuevo(redisAddr)
+	// ctx y no reintenta; ver redisclient.Nuevo). Los defer de los clientes
+	// corren DESPUÉS de servicio.Correr: las requests en vuelo los necesitan
+	// hasta el final del apagado.
+	rdb := redisclient.Nuevo(cfg.redisAddr)
 	defer rdb.Close()
 
 	// PING al arrancar: si Redis no está, el server no arranca. Fail-closed
@@ -360,24 +425,23 @@ func main() {
 	// request entrante de la que heredar un deadline. Le ponemos uno propio
 	// para no quedarnos colgados si Redis no responde.
 	ctxPing, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	err := rdb.Ping(ctxPing).Err()
+	err = rdb.Ping(ctxPing).Err()
 	cancel()
 	if err != nil {
-		log.Fatalf("no pude conectar a Redis en %s: %v", redisAddr, err)
+		log.Fatalf("no pude conectar a Redis en %s: %v", cfg.redisAddr, err)
 	}
-	log.Printf("conectado a Redis en %s", redisAddr)
+	log.Printf("conectado a Redis en %s", cfg.redisAddr)
 
-	addr := ":50051"
-	lis, err := net.Listen("tcp", addr)
+	lis, err := net.Listen("tcp", cfg.grpcAddr)
 	if err != nil {
-		log.Fatalf("no pude escuchar en %s: %v", addr, err)
+		log.Fatalf("no pude escuchar en %s: %v", cfg.grpcAddr, err)
 	}
 
 	// Cliente de Settlement. NewClient no conecta todavía; Connect() arranca
 	// la conexión en segundo plano para que la primera transacción no pague
 	// el costo de conectar (cold start). Si Settlement no está, no impide
 	// arrancar: cada transacción que lo necesite falla rápido (fail-closed).
-	connSettle, err := grpc.NewClient(settlementAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	connSettle, err := grpc.NewClient(cfg.settlementAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Fatalf("cliente de Settlement: %v", err)
 	}
@@ -388,8 +452,11 @@ func main() {
 	reg := metricas.NuevoRegistro()
 	rpc := metricas.NuevoRPC(reg, "fraud_engine")
 	motor := metricas.NuevoMotor(reg)
-	metricas.Servir(metricasAddr, reg)
-	log.Printf("métricas en http://localhost%s/metrics", metricasAddr)
+	var srvMetricas *http.Server
+	if cfg.metricasAddr != "" {
+		srvMetricas = metricas.Servir(cfg.metricasAddr, reg)
+		log.Printf("métricas en %s/metrics", cfg.metricasAddr)
+	}
 
 	// El interceptor envuelve cada llamada: tasa, errores por motivo,
 	// latencia, en vuelo, tardías. Las decisiones salen de la respuesta.
@@ -404,11 +471,18 @@ func main() {
 	pb.RegisterFraudEngineServer(grpcServer, &fraudEngineServer{
 		verificador: verificador,
 		settle:      pb.NewSettlementClient(connSettle),
+		iteraciones: cfg.iteraciones,
 		metricas:    motor,
 	})
 
-	log.Printf("fraud-engine escuchando en %s", addr)
-	if err := grpcServer.Serve(lis); err != nil {
-		log.Fatalf("error sirviendo: %v", err)
+	// Salud estándar de gRPC (para Compose, ECS y k3s). Se registra acá, con
+	// Redis ya verificado: SERVING = listo para atender.
+	salud := servicio.NuevaSalud(grpcServer)
+
+	log.Printf("fraud-engine escuchando en %s", cfg.grpcAddr)
+	plazos := servicio.Plazos{Aviso: cfg.avisoApagado, Espera: cfg.esperaApagado}
+	if err := servicio.Correr(ctx, grpcServer, lis, salud, srvMetricas, plazos); err != nil {
+		log.Printf("fraud-engine: %v", err)
 	}
+	log.Printf("fraud-engine apagado")
 }

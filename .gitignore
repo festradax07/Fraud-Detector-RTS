@@ -3,8 +3,9 @@
 /loadgen
 *.exe
 
-# Documentos privados
-/docs/
+# Documentos privados (guía, roadmap). Los ADRs (docs/adr/) son públicos.
+/docs/*
+!/docs/adr/
 /CLAUDE.md
 
 # Datasets (pesados, se bajan aparte)

@@ -1,0 +1,11 @@
+# Lo que NO se manda a Docker al construir (el "contexto" del build).
+# Sin esto, cada build subiría los ~500MB del dataset: data/ se monta como
+# volumen en tiempo de ejecución, no va dentro de ninguna imagen.
+data/
+resultados/
+docs/
+.git/
+CLAUDE.md
+observabilidad/
+docker-compose.yml
+*.csv
