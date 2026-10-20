@@ -15,6 +15,10 @@ import (
 // UmbralRechazo: un score mayor a esto es fraude (REJECTED_FRAUD).
 const UmbralRechazo = 0.75
 
+// MotivoRiesgoAlto es el motivo de rechazo de la fase opcional (campo
+// rejection_reason, ADR-0005).
+const MotivoRiesgoAlto = "RIESGO_ALTO"
+
 // umbralSigmas: en una categoría de riesgo promedio (peso 1), un monto a 3
 // desvíos de lo normal da exactamente UmbralRechazo. Es la regla de las 3
 // sigmas, una convención estadística clásica: la única decisión de diseño

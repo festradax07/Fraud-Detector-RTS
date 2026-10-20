@@ -2,26 +2,21 @@ package settlement
 
 import (
 	"context"
-	"fmt"
-	"net"
-	"os"
 	"strconv"
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
-	"fd_rts/internal/config"
+	"fd_rts/internal/fallas"
+	"fd_rts/internal/pruebas"
 	"fd_rts/internal/redisclient"
 	pb "fd_rts/proto"
 )
-
-// redisAddr del Redis real de desarrollo.
-var redisAddr = config.Texto("REDIS_ADDR", "localhost:6379") // REDIS_ADDR: para correr los tests desde un contenedor
 
 // entorno es un Settlement real escuchando en un puerto TCP real, contra el
 // Redis real, con un cliente gRPC real apuntándole. Nada simulado.
@@ -30,55 +25,21 @@ type entorno struct {
 	srv     *Servidor
 }
 
-// levantarSettlement arranca el servicio en localhost:0 (el sistema operativo
-// elige un puerto libre) con un prefijo de claves único. Todo se apaga y se
-// limpia al terminar el test. Si Redis no está, el test FALLA.
-func levantarSettlement(t *testing.T, redisAddr string) *entorno {
+// levantarSettlement arranca el servicio REAL sobre rdb/prefijo en un puerto
+// TCP real, con un cliente gRPC real apuntándole (internal/pruebas).
+func levantarSettlement(t *testing.T, rdb *redis.Client, prefijo string) *entorno {
 	t.Helper()
-	rdb := redisclient.Nuevo(redisAddr)
-	prefijo := fmt.Sprintf("test:%d:%d:", os.Getpid(), time.Now().UnixNano())
 	srv := NuevoServidor(rdb, prefijo)
-
-	lis, err := net.Listen("tcp", "localhost:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	g := grpc.NewServer()
-	pb.RegisterSettlementServer(g, srv)
-	// Serve bloquea, así que va en su propia goroutine (tema de la Etapa 6;
-	// acá lo mínimo para tener el server corriendo durante el test).
-	go g.Serve(lis)
-
-	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		t.Fatalf("cliente: %v", err)
-	}
-
-	t.Cleanup(func() {
-		conn.Close()
-		g.Stop()
-		ctx := context.Background()
-		// SCAN recorre TODA la base y después filtra por el patrón: con COUNT
-		// alto son menos viajes (con 100 y 200k claves eran ~2000 por test).
-		iter := rdb.Scan(ctx, 0, prefijo+"*", 10000).Iterator()
-		for iter.Next(ctx) {
-			rdb.Del(ctx, iter.Val())
-		}
-		rdb.Close()
-	})
+	conn := pruebas.ServirGRPC(t, func(g *grpc.Server) { pb.RegisterSettlementServer(g, srv) })
 	return &entorno{cliente: pb.NewSettlementClient(conn), srv: srv}
 }
 
-// redisDisponible hace FALLAR el test si Redis no está levantado.
-func redisDisponible(t *testing.T) {
+// settlementDePrueba: Settlement real sobre el Redis real, con prefijo único.
+// Si Redis no está, el test FALLA.
+func settlementDePrueba(t *testing.T) *entorno {
 	t.Helper()
-	rdb := redisclient.Nuevo(redisAddr)
-	defer rdb.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		t.Fatalf("Redis no disponible en %s (levantalo con: docker start redis-drts): %v", redisAddr, err)
-	}
+	rdb, prefijo := pruebas.Redis(t)
+	return levantarSettlement(t, rdb, prefijo)
 }
 
 // commit llama a CommitTransaction por red y devuelve también el trailer.
@@ -127,7 +88,6 @@ type intento struct {
 func (i intento) req(txID string) *pb.SettlementRequest { return reqSettle(txID, i.fraude, i.hace) }
 
 func TestCommitTransaction(t *testing.T) {
-	redisDisponible(t)
 	casos := []struct {
 		nombre     string
 		req        intento
@@ -141,7 +101,7 @@ func TestCommitTransaction(t *testing.T) {
 	}
 	for _, c := range casos {
 		t.Run(c.nombre, func(t *testing.T) {
-			e := levantarSettlement(t, redisAddr)
+			e := settlementDePrueba(t)
 			resp, trailer, err := e.commit(t, c.req.req("t1"))
 			if err != nil {
 				t.Fatalf("error inesperado: %v", err)
@@ -169,8 +129,7 @@ func TestCommitTransaction(t *testing.T) {
 }
 
 func TestLatenciaExtremoAExtremo(t *testing.T) {
-	redisDisponible(t)
-	e := levantarSettlement(t, redisAddr)
+	e := settlementDePrueba(t)
 	resp, _, err := e.commit(t, reqSettle("t1", false, 50*time.Millisecond))
 	if err != nil {
 		t.Fatalf("error: %v", err)
@@ -184,8 +143,7 @@ func TestLatenciaExtremoAExtremo(t *testing.T) {
 // Reintentar el mismo tx_id no crea un registro nuevo: HSET sobre la misma
 // clave deja el registro igual.
 func TestIdempotencia(t *testing.T) {
-	redisDisponible(t)
-	e := levantarSettlement(t, redisAddr)
+	e := settlementDePrueba(t)
 	for i := 0; i < 3; i++ {
 		if _, _, err := e.commit(t, reqSettle("t1", false, 0)); err != nil {
 			t.Fatalf("intento %d: %v", i, err)
@@ -198,8 +156,7 @@ func TestIdempotencia(t *testing.T) {
 }
 
 func TestRequestInvalida(t *testing.T) {
-	redisDisponible(t)
-	e := levantarSettlement(t, redisAddr)
+	e := settlementDePrueba(t)
 	casos := []struct {
 		nombre string
 		req    *pb.SettlementRequest
@@ -210,8 +167,8 @@ func TestRequestInvalida(t *testing.T) {
 	for _, c := range casos {
 		t.Run(c.nombre, func(t *testing.T) {
 			_, trailer, err := e.commit(t, c.req)
-			if status.Code(err) != codes.InvalidArgument {
-				t.Errorf("código = %v, se esperaba InvalidArgument", status.Code(err))
+			if status.Code(err) != codes.InvalidArgument || fallas.Motivo(err) != fallas.RequestInvalida {
+				t.Errorf("código=%v motivo=%q, se esperaba InvalidArgument / %s", status.Code(err), fallas.Motivo(err), fallas.RequestInvalida)
 			}
 			// El trailer viaja también con errores.
 			if len(trailer.Get(TrailerSettleUs)) != 1 {
@@ -223,11 +180,14 @@ func TestRequestInvalida(t *testing.T) {
 
 // Redis caído: sin registro no hay commit (fail-closed), y rápido.
 func TestRedisCaido(t *testing.T) {
-	e := levantarSettlement(t, "localhost:1")
+	// Puerto donde no escucha nadie: Redis caído.
+	rdb := redisclient.Nuevo("localhost:1")
+	t.Cleanup(func() { rdb.Close() })
+	e := levantarSettlement(t, rdb, "test:")
 	inicio := time.Now()
 	_, _, err := e.commit(t, reqSettle("t1", false, 0))
-	if status.Code(err) != codes.Unavailable {
-		t.Errorf("código = %v, se esperaba Unavailable (err=%v)", status.Code(err), err)
+	if status.Code(err) != codes.Unavailable || fallas.Motivo(err) != fallas.RedisNoDisponible {
+		t.Errorf("código=%v motivo=%q, se esperaba Unavailable / %s (err=%v)", status.Code(err), fallas.Motivo(err), fallas.RedisNoDisponible, err)
 	}
 	if tardo := time.Since(inicio); tardo > 20*time.Millisecond {
 		t.Errorf("tardó %v en fallar, se esperaba fallo rápido", tardo)
@@ -238,7 +198,6 @@ func TestRedisCaido(t *testing.T) {
 // reintento no puede deshacer un commit (la plata ya se movió) ni
 // convertir un rechazo en commit.
 func TestReintentoNoPisaElResultado(t *testing.T) {
-	redisDisponible(t)
 	casos := []struct {
 		nombre     string
 		primero    intento
@@ -270,7 +229,7 @@ func TestReintentoNoPisaElResultado(t *testing.T) {
 	}
 	for _, c := range casos {
 		t.Run(c.nombre, func(t *testing.T) {
-			e := levantarSettlement(t, redisAddr)
+			e := settlementDePrueba(t)
 			if _, _, err := e.commit(t, c.primero.req("t1")); err != nil {
 				t.Fatalf("primer intento: %v", err)
 			}

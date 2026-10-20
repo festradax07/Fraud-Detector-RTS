@@ -4,8 +4,8 @@
 #
 #   docker build --target fraud-engine -t drts/fraud-engine .
 #
-# Etapa 1 (compilar): la toolchain de Go compila TODOS los binarios juntos.
-# Etapa 2 (una por servicio): una imagen mínima con solo su binario.
+# Paso 1 del build (compilar): la toolchain de Go compila TODOS los binarios.
+# Paso 2 (uno por servicio): una imagen mínima con solo su binario.
 #
 # Las mismas imágenes van a todos los entornos (Compose, nube): si el
 # artefacto cambia entre entornos, la comparación deja de valer (ADR-0018).

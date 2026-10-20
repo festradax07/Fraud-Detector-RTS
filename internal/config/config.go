@@ -1,5 +1,5 @@
 // Package config lee la configuración de los servicios desde variables de
-// entorno (Etapa 7.5).
+// entorno (ADR-0017).
 //
 // Por qué variables de entorno: el MISMO binario (la misma imagen) tiene que
 // correr en la notebook, en Docker Compose y en AWS ECS. Lo que cambia entre

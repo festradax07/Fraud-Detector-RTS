@@ -18,7 +18,7 @@ package metricas
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -61,15 +61,19 @@ func NuevoRegistro() *prometheus.Registry {
 	return reg
 }
 
-// Servir expone reg en http://addr/metrics, en segundo plano. Si no puede
-// escuchar, lo loguea y sigue: sin métricas el servicio funciona igual.
+// Servir expone reg en http://addr/metrics, en segundo plano. Con addr vacía
+// no expone nada y devuelve nil (METRICAS_ADDR=""). Si no puede escuchar, lo
+// loguea y sigue: sin métricas el servicio funciona igual.
 func Servir(addr string, reg *prometheus.Registry) *http.Server {
+	if addr == "" {
+		return nil
+	}
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("métricas: no pude servir en %s: %v", addr, err)
+			slog.Error("métricas: no se pudo servir", "addr", addr, "error", err)
 		}
 	}()
 	return srv

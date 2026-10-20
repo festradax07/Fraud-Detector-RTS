@@ -183,7 +183,7 @@ flowchart TD
     H2 --> J
     J -- COMMITTED --> OK[OK · aprobada]
     J -- timeout --> X5[DeadlineExceeded<br/>SETTLEMENT_TIMEOUT:<br/>resultado AMBIGUO, reintentar con el mismo tx_id]
-    J -- caído --> X6[Unavailable<br/>SETTLEMENT_NO_DISPONIBLE]
+    J -- "caído / conexión cortada" --> X6[Unavailable<br/>SETTLEMENT_NO_DISPONIBLE:<br/>también ambiguo, reintentar]
 ```
 
 Por qué un fraude es una respuesta `OK` y no un error, y cómo se distinguen
@@ -216,6 +216,8 @@ timeout esperando a Settlement es "resultado desconocido" y cómo se resuelve:
 | [`redisclient`](internal/redisclient/redisclient.go) | Cliente de Redis con la configuración del hot path: respeta el deadline del `ctx` y no reintenta. |
 | [`servicio`](internal/servicio/servicio.go) | Ciclo de vida: salud gRPC estándar y apagado ordenado ante SIGTERM. |
 | [`config`](internal/config/config.go) | Configuración desde variables de entorno, con validación al arrancar. |
+| [`registro`](internal/registro/registro.go) | Logs estructurados (`log/slog`) con niveles, desde el entorno. |
+| [`pruebas`](internal/pruebas/pruebas.go) | Helpers de los tests: Redis real con prefijo único y servidores gRPC reales en puertos reales. |
 
 ### Contrato
 
@@ -274,9 +276,9 @@ contrato.
 | Tema | ADRs |
 |---|---|
 | **Modelo de tiempo real** | [0002](docs/adr/0002-camino-de-decision-sincronico-con-grpc.md) camino sincrónico con deadline propagado · [0003](docs/adr/0003-control-de-admision-temprano.md) admisión temprana · [0004](docs/adr/0004-computacion-imprecisa.md) computación imprecisa · [0011](docs/adr/0011-costo-simulado-y-wcet.md) peor caso, no promedio |
-| **Correctitud ante fallas** | [0005](docs/adr/0005-fraude-no-es-error.md) un fraude no es un error · [0009](docs/adr/0009-fail-closed-y-fallo-rapido.md) fail-closed y fallo rápido · [0012](docs/adr/0012-settlement-segundo-servicio-sincronico.md) Settlement con timeout propio · [0013](docs/adr/0013-ambiguedad-del-timeout-e-idempotencia.md) ambigüedad del timeout e idempotencia |
+| **Correctitud ante fallas** | [0005](docs/adr/0005-fraude-no-es-error.md) un fraude no es un error · [0009](docs/adr/0009-fail-closed-y-fallo-rapido.md) fail-closed y fallo rápido · [0012](docs/adr/0012-settlement-segundo-servicio-sincronico.md) Settlement con timeout propio · [0013](docs/adr/0013-ambiguedad-del-timeout-e-idempotencia.md) ambigüedad del timeout e idempotencia · [0022](docs/adr/0022-conexion-caida-es-resultado-ambiguo.md) conexión caída = ambiguo |
 | **Detección** | [0006](docs/adr/0006-que-se-registra-ante-un-rechazo.md) qué se registra ante un rechazo · [0007](docs/adr/0007-validacion-estricta-de-la-request.md) validación · [0008](docs/adr/0008-redis-un-viaje-atomico.md) Redis en un viaje atómico · [0010](docs/adr/0010-modelo-de-scoring.md) scoring |
-| **Medir y operar** | [0014](docs/adr/0014-load-generator-de-lazo-abierto.md) generador de lazo abierto · [0015](docs/adr/0015-observabilidad-prometheus-grafana.md) observabilidad · [0016](docs/adr/0016-tests-contra-infraestructura-real.md) tests reales · [0017](docs/adr/0017-configuracion-por-entorno-y-apagado-ordenado.md) configuración y apagado · [0018](docs/adr/0018-evaluar-en-distintos-entornos.md) evaluar por entornos · [0019](docs/adr/0019-kafka-como-columna-de-eventos.md) Kafka como columna de eventos · [0020](docs/adr/0020-imagenes-salud-y-compose.md) imágenes, salud y Compose |
+| **Medir y operar** | [0014](docs/adr/0014-load-generator-de-lazo-abierto.md) generador de lazo abierto · [0015](docs/adr/0015-observabilidad-prometheus-grafana.md) observabilidad · [0016](docs/adr/0016-tests-contra-infraestructura-real.md) tests reales · [0017](docs/adr/0017-configuracion-por-entorno-y-apagado-ordenado.md) configuración y apagado · [0018](docs/adr/0018-evaluar-en-distintos-entornos.md) evaluar por entornos · [0019](docs/adr/0019-kafka-como-columna-de-eventos.md) Kafka como columna de eventos · [0020](docs/adr/0020-imagenes-salud-y-compose.md) imágenes, salud y Compose · [0021](docs/adr/0021-logs-con-niveles.md) logs con niveles |
 
 ## Lo que mostraron las mediciones
 
@@ -352,10 +354,13 @@ escrito impide arrancar.
 | `GRPC_ADDR` | `:50051` | `:50052` | dónde escucha |
 | `METRICAS_ADDR` | `:2112` | `:2113` | `/metrics` (`""` = no exponer) |
 | `REDIS_ADDR` | `localhost:6379` | `localhost:6379` | Redis |
+| `REDIS_PREFIJO` | `drts:` | `drts:` | prefijo de las claves (permite compartir un Redis) |
 | `SETTLEMENT_ADDR` | `localhost:50052` | — | Settlement |
 | `ITERACIONES_SCORING` | `10000000` | — | costo de CPU simulado del scoring (~16ms) |
 | `APAGADO_ESPERA` | `5s` | `5s` | máximo para terminar las requests en vuelo |
 | `APAGADO_AVISO` | `0s` | `0s` | tiempo en `NOT_SERVING` antes de dejar de atender (detrás de un balanceador) |
+| `LOG_NIVEL` | `info` | `info` | `debug` agrega una línea por transacción ([ADR-0021](docs/adr/0021-logs-con-niveles.md)) |
+| `LOG_FORMATO` | `texto` | `texto` | `json` para la nube |
 
 El generador de carga se configura por flags: `go run ./cmd/loadgen -h`.
 

@@ -1,5 +1,5 @@
 // Package servicio corre un servidor gRPC hasta que lo manden a apagar, y lo
-// apaga EN ORDEN (Etapa 7.5).
+// apaga EN ORDEN (ADR-0017, ADR-0020).
 //
 // Por qué: un orquestador (Docker Compose, AWS ECS) detiene un contenedor
 // mandándole SIGTERM y, si no termina en un plazo (10s en Compose, 30s por
@@ -11,9 +11,12 @@ package servicio
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
@@ -32,6 +35,19 @@ func NuevaSalud(g *grpc.Server) *health.Server {
 	s := health.NewServer()
 	healthpb.RegisterHealthServer(g, s)
 	return s
+}
+
+// ContextoDeApagado devuelve un ctx que se cancela al llegar SIGTERM (lo
+// que manda un orquestador: Compose, ECS, k3s) o Ctrl+C. Después de la
+// primera señal se restaura el comportamiento normal: una segunda señal
+// mata el proceso en el acto. Llamar stop al terminar.
+func ContextoDeApagado() (ctx context.Context, stop context.CancelFunc) {
+	ctx, stop = signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
+	return ctx, stop
 }
 
 // Plazos del apagado.
@@ -87,11 +103,11 @@ func Correr(ctx context.Context, g *grpc.Server, lis net.Listener, salud *health
 	if salud != nil {
 		salud.Shutdown() // NOT_SERVING para todos los servicios, y ya no cambia
 		if plazos.Aviso > 0 {
-			log.Printf("apagando: NOT_SERVING, se sigue atendiendo %v para que el balanceador lo vea", plazos.Aviso)
+			slog.Info("apagando: NOT_SERVING, se sigue atendiendo para que el balanceador lo vea", "aviso", plazos.Aviso)
 			time.Sleep(plazos.Aviso)
 		}
 	}
-	log.Printf("apagando: no se aceptan requests nuevas, esperando las que están en vuelo (máximo %v)", espera)
+	slog.Info("apagando: no se aceptan requests nuevas, esperando las que están en vuelo", "maximo", espera)
 	terminado := make(chan struct{})
 	go func() {
 		g.GracefulStop() // bloquea hasta que terminen las requests en vuelo
@@ -100,18 +116,18 @@ func Correr(ctx context.Context, g *grpc.Server, lis net.Listener, salud *health
 	var errApagado error
 	select {
 	case <-terminado:
-		log.Printf("apagando: todas las requests en vuelo terminaron")
+		slog.Info("apagando: todas las requests en vuelo terminaron")
 	case <-time.After(espera):
 		go g.Stop() // cancela el ctx de las que quedan; no esperarlo (ver arriba)
 		errApagado = errors.New("apagado forzado: quedaban requests en vuelo")
-		log.Printf("apagando: %v", errApagado)
+		slog.Warn("apagando", "error", errApagado)
 	}
 
 	if metricas != nil {
 		ctxM, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 		if err := metricas.Shutdown(ctxM); err != nil {
-			log.Printf("apagando métricas: %v", err)
+			slog.Warn("apagando métricas", "error", err)
 		}
 	}
 	return errApagado

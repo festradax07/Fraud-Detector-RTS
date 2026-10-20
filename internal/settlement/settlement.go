@@ -7,15 +7,15 @@
 // puede importar: los tests del Fraud-Engine levantan este mismo servidor,
 // real, en un puerto TCP real.
 //
-// Por ahora el registro va directo a Redis. En la Etapa 8 se suma el evento
-// de auditoría asíncrono (Kafka, cold path).
+// El registro va a Redis. Los eventos de auditoría asíncronos (Kafka, fuera
+// del camino de decisión) están planificados en ADR-0019.
 package settlement
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"strconv"
 	"time"
 
@@ -23,9 +23,10 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
 
+	"fd_rts/internal/fallas"
 	"fd_rts/internal/presupuesto"
+	"fd_rts/internal/registro"
 	pb "fd_rts/proto"
 )
 
@@ -75,21 +76,22 @@ func (s *Servidor) CommitTransaction(ctx context.Context, req *pb.SettlementRequ
 		// Si el cliente ya se fue (venció su timeout o canceló), no hay a
 		// quién mandarle el trailer: gRPC devolvería "SendHeader called
 		// multiple times". Ojo: que el cliente se haya ido NO deshace lo que
-		// ya se hizo acá (ver "ambigüedad del timeout" en GUIA-GO).
+		// ya se hizo acá (ambigüedad del timeout, ADR-0013).
 		if ctx.Err() != nil {
 			return
 		}
 		us := strconv.FormatInt(time.Since(inicio).Microseconds(), 10)
 		if err := grpc.SetTrailer(ctx, metadata.Pairs(TrailerSettleUs, us)); err != nil {
-			log.Printf("tx_id=%s no pude poner el trailer: %v", req.TxId, err)
+			slog.Warn("no se pudo poner el trailer", "tx_id", req.TxId, "error", err)
 		}
 	}()
 
+	// Errores con motivo (ErrorInfo), igual que el motor (ADR-0005).
 	if req.TxId == "" {
-		return nil, status.Error(codes.InvalidArgument, "falta tx_id")
+		return nil, fallas.Nueva(codes.InvalidArgument, fallas.RequestInvalida, "falta tx_id")
 	}
 	if req.Evaluation == nil {
-		return nil, status.Error(codes.InvalidArgument, "falta evaluation")
+		return nil, fallas.Nueva(codes.InvalidArgument, fallas.RequestInvalida, "falta evaluation")
 	}
 
 	estado := pb.TxStatus_STATUS_COMMITTED
@@ -98,9 +100,9 @@ func (s *Servidor) CommitTransaction(ctx context.Context, req *pb.SettlementRequ
 	}
 
 	// Latencia de extremo a extremo: desde que el cliente emitió la
-	// transacción hasta ahora. Compara relojes de dos procesos: vale porque
-	// todo corre en la misma máquina (single-host, ver CLAUDE.md). Con
-	// varios hosts haría falta sincronizar relojes.
+	// transacción hasta ahora. Compara relojes de dos procesos: vale en una
+	// sola máquina; entre hosts depende de que los relojes estén
+	// sincronizados (ADR-0018).
 	var latencia time.Duration
 	if req.EmissionTimestampNs > 0 {
 		latencia = inicio.Sub(time.Unix(0, req.EmissionTimestampNs))
@@ -114,8 +116,8 @@ func (s *Servidor) CommitTransaction(ctx context.Context, req *pb.SettlementRequ
 	// Registro en Redis, con el script registrarUnaVez: si el tx_id ya tiene
 	// un resultado final, gana ese (idempotencia de verdad).
 	//
-	// Sin TTL: es el registro de la transacción. En la Etapa 8 la auditoría
-	// pasa a Kafka y se puede revisar si Redis tiene que guardarlo.
+	// Sin TTL: es el registro de la transacción. Cuando la auditoría pase a
+	// Kafka (ADR-0019), Redis podrá guardarlo con TTL.
 	campos := []any{
 		"estado", estado.String(),
 		"user_id", req.UserId,
@@ -132,22 +134,24 @@ func (s *Servidor) CommitTransaction(ctx context.Context, req *pb.SettlementRequ
 		err = fmt.Errorf("respuesta inesperada del script: %v", res)
 	}
 	if err != nil {
-		log.Printf("tx_id=%s SIN REGISTRAR: %v", req.TxId, err)
+		slog.Warn("sin registrar", "tx_id", req.TxId, "error", err)
 		// Sin registro no hay commit: fail-closed.
 		if errors.Is(err, context.DeadlineExceeded) {
-			return nil, status.Error(codes.DeadlineExceeded, "se agotó el deadline registrando la transacción")
+			return nil, fallas.Nueva(codes.DeadlineExceeded, fallas.RedisTimeout, "se agotó el deadline registrando la transacción")
 		}
-		return nil, status.Error(codes.Unavailable, "no se pudo registrar la transacción")
+		return nil, fallas.Nueva(codes.Unavailable, fallas.RedisNoDisponible, "no se pudo registrar la transacción")
 	}
 
 	// Lo que quedó registrado (puede ser el resultado de un intento anterior).
 	registrado := pb.TxStatus(pb.TxStatus_value[res[0]])
 	motivo := res[1]
 	if registrado != estado {
-		log.Printf("tx_id=%s REINTENTO: se mantiene %s (esta evaluación daba %s)", req.TxId, registrado, estado)
+		// Normal en un reintento (mismo tx_id): gana el primer resultado final.
+		slog.Info("reintento: se mantiene el resultado registrado", "tx_id", req.TxId, "registrado", registrado, "evaluado", estado)
 	}
-
-	log.Printf("tx_id=%s %s latencia_e2e=%v", req.TxId, registrado, latencia)
+	if registro.Depurando(ctx) {
+		slog.DebugContext(ctx, "registrada", "tx_id", req.TxId, "estado", registrado, "latencia_e2e", latencia)
+	}
 	// Message: para un rechazo, el motivo registrado (el motor lo necesita si
 	// un reintento se evaluó distinto); si no, el nombre del estado.
 	mensaje := registrado.String()

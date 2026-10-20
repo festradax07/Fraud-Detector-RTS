@@ -39,15 +39,17 @@ escriben: [ADR-0001](0001-registrar-decisiones-con-adrs.md) y la
 | [0018](0018-evaluar-en-distintos-entornos.md) | Evaluar el sistema real en distintos entornos, no contra un simulador | Aceptada | transversal (afecta a 7.5, la etapa de nube y la calibración) |
 | [0019](0019-kafka-como-columna-de-eventos.md) | Kafka como columna de eventos, fuera del camino de decisión | Aceptada (pendiente de implementación) | 8 (pasa a ser parte del núcleo) |
 | [0020](0020-imagenes-salud-y-compose.md) | Imágenes distroless, salud por gRPC y Compose por perfiles | Aceptada | 7.5 |
+| [0021](0021-logs-con-niveles.md) | Logs estructurados con niveles; el detalle por transacción en Debug | Aceptada | refactor posterior a la 7.5 |
+| [0022](0022-conexion-caida-es-resultado-ambiguo.md) | Una conexión caída con la request en vuelo es un resultado ambiguo | Aceptada | refactor posterior a la 7.5 (complementa a ADR-0013) |
 
 ## Cómo leerlos
 
 - **Modelo de tiempo real:** 0002 (sincronía y deadline), 0003 (admisión),
   0004 (computación imprecisa), 0011 (peor caso, no promedio).
 - **Correctitud ante fallas:** 0005 (fraude vs error), 0009 (fail-closed),
-  0012 (Settlement), 0013 (ambigüedad del timeout e idempotencia).
+  0012 (Settlement), 0013 (ambigüedad del timeout e idempotencia), 0022 (conexión caída).
 - **Detección:** 0006 (qué se registra), 0007 (validación), 0008 (Redis),
   0010 (scoring).
 - **Medir y operar:** 0014 (load generator), 0015 (observabilidad), 0016
   (tests reales), 0017 (configuración y apagado), 0018 (entornos), 0019
-  (Kafka), 0020 (imágenes, salud y Compose).
+  (Kafka), 0020 (imágenes, salud y Compose), 0021 (logs).

@@ -3,7 +3,17 @@
 // estadísticas y los tests usan exactamente lo mismo.
 package redisclient
 
-import "github.com/redis/go-redis/v9"
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+)
+
+// PrefijoPorDefecto separa las claves del sistema de cualquier otra cosa en
+// el mismo Redis (REDIS_PREFIJO lo cambia; los tests usan uno único).
+const PrefijoPorDefecto = "drts:"
 
 // Nuevo crea el cliente. NewClient no conecta todavía: arma un pool de
 // conexiones que se abren a medida que se usan.
@@ -24,4 +34,21 @@ func Nuevo(addr string) *redis.Client {
 		// `for attempt < DialerRetries`), y 0 = default 5. 1 = un solo intento.
 		DialerRetries: 1,
 	})
+}
+
+// Conectar crea el cliente y verifica que Redis responda (PING). Si no
+// responde, devuelve error: los servicios no arrancan sin Redis
+// (fail-closed desde el arranque, ADR-0009).
+//
+// ctx es el del arranque, no el de una request: no hay deadline que
+// heredar, así que se le pone uno propio para no quedar colgado.
+func Conectar(ctx context.Context, addr string) (*redis.Client, error) {
+	rdb := Nuevo(addr)
+	ctxPing, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := rdb.Ping(ctxPing).Err(); err != nil {
+		rdb.Close()
+		return nil, fmt.Errorf("sin respuesta de Redis en %s: %w", addr, err)
+	}
+	return rdb, nil
 }

@@ -26,7 +26,7 @@ const Dominio = "drts"
 // Motivos. Son parte del contrato con los clientes: no cambiarlos a la
 // ligera.
 const (
-	// Admisión (Etapa 1).
+	// Admisión (ADR-0002, ADR-0003).
 	SinDeadline = "SIN_DEADLINE"
 	EarlyDrop   = "EARLY_DROP"
 
@@ -40,8 +40,11 @@ const (
 
 	// Settlement.
 	// SettlementTimeout es AMBIGUO: la transacción pudo haberse comprometido
-	// igual (Etapa 5). El cliente reintenta con el mismo tx_id.
-	SettlementTimeout      = "SETTLEMENT_TIMEOUT"
+	// igual (ADR-0013). El cliente reintenta con el mismo tx_id.
+	SettlementTimeout = "SETTLEMENT_TIMEOUT"
+	// SettlementNoDisponible también es ambiguo si la conexión entre el
+	// motor y Settlement se cayó con la request en vuelo (ADR-0022): el
+	// cliente reintenta igual.
 	SettlementNoDisponible = "SETTLEMENT_NO_DISPONIBLE"
 	AbortadaPorTimeout     = "ABORTADA_POR_TIMEOUT"
 	EstadoInesperado       = "ESTADO_INESPERADO"

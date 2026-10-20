@@ -4,8 +4,8 @@
 // Todas son funciones puras: reciben duraciones y no leen el reloj ni el
 // context. Quien llama calcula D_rem = deadline - ahora y se lo pasa.
 //
-// Los valores son PUNTOS DE PARTIDA de diseño (CLAUDE.md), no mediciones:
-// se recalibran midiendo en la Etapa 10.
+// Los valores son PUNTOS DE PARTIDA de diseño, no mediciones: se recalibran
+// midiendo en cada entorno (ADR-0003, ADR-0004, ADR-0018).
 package presupuesto
 
 import "time"
@@ -26,8 +26,8 @@ const (
 
 	// ReservaSettleNet es C_settle + C_net: lo que hay que reservar para el
 	// commit en Settlement y los viajes de red. Sale de despejar el umbral de
-	// admisión del diseño: 35ms - WCET(M) = 15ms. Van juntos hasta la
-	// Etapa 5, donde Settlement existe y C_net se mide por primera vez.
+	// admisión del diseño: 35ms - WCET(M) = 15ms. Van juntos; medido por
+	// separado, C_net es mucho menor (ADR-0012).
 	ReservaSettleNet = 15 * time.Millisecond
 
 	// MinParaAdmitir es el mínimo que tiene que quedar para que valga la
@@ -37,7 +37,7 @@ const (
 )
 
 // Admitir dice si una transacción con dRem de tiempo restante se procesa
-// (control de admisión, Etapa 1). Si no alcanza para la mandatoria más
+// (control de admisión, ADR-0003). Si no alcanza para la mandatoria más
 // Settlement y red, se rechaza sin hacer nada: load shedding.
 func Admitir(dRem time.Duration) bool {
 	return dRem >= MinParaAdmitir

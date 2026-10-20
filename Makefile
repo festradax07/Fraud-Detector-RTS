@@ -9,7 +9,7 @@ run-server:
 run-settlement:
 	go run ./cmd/settlement
 
-# Load-generator (Etapa 6). Requieren Redis, Settlement y el Fraud-Engine
+# Load-generator (ADR-0014). Requieren Redis, Settlement y el Fraud-Engine
 # corriendo, y las estadísticas cargadas.
 carga-nominal:
 	go run ./cmd/loadgen -modo nominal
@@ -17,7 +17,7 @@ carga-nominal:
 carga-sobrecarga:
 	go run ./cmd/loadgen -modo sobrecarga
 
-# Observabilidad (Etapa 7): Prometheus + Grafana provisionados.
+# Observabilidad (ADR-0015): Prometheus + Grafana provisionados.
 # Grafana en http://localhost:3000 (sin login), Prometheus en :9090.
 obs-up:
 	docker compose up -d
@@ -25,7 +25,7 @@ obs-up:
 obs-down:
 	docker compose down
 
-# Sistema completo en Docker Compose (Etapa 7.5): Redis, carga de
+# Sistema completo en Docker Compose (ADR-0020): Redis, carga de
 # estadísticas, Settlement y Fraud-Engine, más la observabilidad.
 sistema-up:
 	docker compose --profile sistema up -d --build
