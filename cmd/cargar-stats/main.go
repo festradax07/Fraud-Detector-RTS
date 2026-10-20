@@ -19,7 +19,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"math"
 	"os"
 	"sort"
@@ -29,6 +28,7 @@ import (
 	"fd_rts/internal/mandatoria"
 	"fd_rts/internal/opcional"
 	"fd_rts/internal/redisclient"
+	"fd_rts/internal/registro"
 )
 
 // acumulador lleva media y varianza de ln(monto) en una sola pasada, sin
@@ -58,12 +58,16 @@ func (a *acumulador) desvio() float64 { return math.Sqrt(a.m2 / float64(a.n)) }
 func main() {
 	rutaCSV := flag.String("csv", "data/fraudTrain.csv", "CSV de entrenamiento (dataset Sparkov)")
 	redisAddr := flag.String("redis", "localhost:6379", "dirección de Redis")
-	prefijo := flag.String("prefijo", "drts:", "prefijo de claves (el mismo que usa el server)")
+	prefijo := flag.String("prefijo", redisclient.PrefijoPorDefecto, "prefijo de claves (el mismo que usan los servicios)")
 	flag.Parse()
+
+	if err := registro.Configurar("cargar_stats"); err != nil {
+		registro.Fatal("configuración de logs inválida", "error", err)
+	}
 
 	porCategoria, err := leerCSV(*rutaCSV)
 	if err != nil {
-		log.Fatalf("leyendo %s: %v", *rutaCSV, err)
+		registro.Fatal("no se pudo leer el dataset", "csv", *rutaCSV, "error", err)
 	}
 
 	// Totales para la tasa de fraude global.
@@ -73,7 +77,7 @@ func main() {
 		fraudes += a.fraudes
 	}
 	if fraudes == 0 {
-		log.Fatalf("el CSV no tiene fraudes: no se puede calcular el peso")
+		registro.Fatal("el CSV no tiene fraudes: no se puede calcular el peso", "csv", *rutaCSV)
 	}
 	tasaGlobal := float64(fraudes) / float64(total)
 
@@ -106,7 +110,7 @@ func main() {
 			opcional.CampoPeso:      peso,
 		})
 		if err != nil {
-			log.Fatalf("guardando %s en Redis: %v", c, err)
+			registro.Fatal("no se pudo guardar en Redis", "categoria", c, "error", err)
 		}
 		fmt.Printf("%-16s %8d %9.4f %10.4f %7.3f %7.3f%%\n", c, a.n, a.media, a.desvio(), peso, 100*tasa)
 	}

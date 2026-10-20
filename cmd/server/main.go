@@ -1,20 +1,21 @@
 // Fraud-Engine: decide si una transacción se aprueba o rechaza bajo un
-// deadline duro de 200ms. Implementa el control de admisión (Etapa 1), la
-// fase mandatoria contra Redis (Etapas 2 y 3) y la fase opcional según el
-// slack time (Etapa 4).
+// deadline duro de 200ms.
+//
+// El recorrido de cada transacción (EvaluateTransaction) es:
+//
+//	admitir → validar → consultar (Redis, 1 viaje) → reglas mandatorias →
+//	fase opcional según el slack → posición confiable → liquidar (Settlement)
+//
+// Las decisiones de diseño de cada paso están en docs/adr/.
 package main
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
-	"net/http"
-	"os"
-	"os/signal"
 	"strconv"
-	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
@@ -30,30 +31,19 @@ import (
 	"fd_rts/internal/opcional"
 	"fd_rts/internal/presupuesto"
 	"fd_rts/internal/redisclient"
+	"fd_rts/internal/registro"
 	"fd_rts/internal/servicio"
 	"fd_rts/internal/settlement"
 	pb "fd_rts/proto"
 )
 
-// Motivos de rechazo por fraude (campo rejection_reason). Son códigos fijos
-// para que el cliente y Settlement puedan decidir según el motivo; el
-// detalle (cuántos intentos, cuántos km/h) va al log.
-const (
-	motivoBlacklist      = "BLACKLIST"
-	motivoCardTesting    = "CARD_TESTING"
-	motivoViajeImposible = "VIAJE_IMPOSIBLE"
-	motivoRiesgoAlto     = "RIESGO_ALTO" // fase opcional: score > umbral
-)
-
-// Configuración por variables de entorno (Etapa 7.5). Los valores por
-// defecto son los que se usaban fijos en el código hasta la Etapa 7.
+// Configuración por variables de entorno (ADR-0017).
 const (
 	// iteracionesPorDefecto fija el costo de CPU SIMULADO del scoring (el
-	// Z-score real tarda ~40ns; esto simula un modelo más pesado). Medido en
-	// esta máquina (Etapa 4): 10M ≈ 16ms de media, ≈ 19ms de máximo, cómodo
-	// dentro de WCET(O) = 80ms. Es una perilla para las Etapas 6 y 10, no un
-	// valor del modelo: por eso se puede cambiar por entorno
-	// (ITERACIONES_SCORING) sin recompilar.
+	// Z-score real tarda ~40ns; esto simula un modelo más pesado, ADR-0011).
+	// Medido en la máquina de desarrollo: 10M ≈ 16ms de media, ≈ 19ms de
+	// máximo, cómodo dentro de WCET(O) = 80ms. Es una perilla, no un valor
+	// del modelo: se cambia por entorno (ITERACIONES_SCORING).
 	iteracionesPorDefecto = 10_000_000
 
 	redisAddrPorDefecto = "localhost:6379"
@@ -64,6 +54,7 @@ type configuracion struct {
 	grpcAddr       string        // GRPC_ADDR: dónde escucha el servicio
 	metricasAddr   string        // METRICAS_ADDR: /metrics ("" = no exponer)
 	redisAddr      string        // REDIS_ADDR
+	redisPrefijo   string        // REDIS_PREFIJO: prefijo de las claves
 	settlementAddr string        // SETTLEMENT_ADDR
 	iteraciones    int           // ITERACIONES_SCORING: costo simulado del scoring
 	esperaApagado  time.Duration // APAGADO_ESPERA: máximo para drenar requests en vuelo
@@ -75,6 +66,7 @@ func leerConfiguracion() (configuracion, error) {
 		grpcAddr:       config.Texto("GRPC_ADDR", ":50051"),
 		metricasAddr:   config.Texto("METRICAS_ADDR", ":2112"),
 		redisAddr:      config.Texto("REDIS_ADDR", redisAddrPorDefecto),
+		redisPrefijo:   config.Texto("REDIS_PREFIJO", redisclient.PrefijoPorDefecto),
 		settlementAddr: config.Texto("SETTLEMENT_ADDR", "localhost:50052"),
 	}
 	var err error
@@ -101,195 +93,192 @@ func leerConfiguracion() (configuracion, error) {
 type fraudEngineServer struct {
 	pb.UnimplementedFraudEngineServer
 	verificador *mandatoria.Verificador
-	// settle es el cliente gRPC de Settlement: desde la Etapa 5 el
-	// Fraud-Engine es servidor (de los clientes) Y cliente (de Settlement).
+	// settle es el cliente gRPC de Settlement: el Fraud-Engine es servidor
+	// (de los clientes) y cliente (de Settlement).
 	settle pb.SettlementClient
 	// iteraciones de costo simulado del scoring (ITERACIONES_SCORING).
 	iteraciones int
-	// metricas del modelo temporal (Etapa 7). Puede ser nil: los métodos no
-	// hacen nada en ese caso.
+	// metricas del modelo temporal. Puede ser nil: los métodos no hacen nada
+	// en ese caso.
 	metricas *metricas.Motor
 }
 
 func (s *fraudEngineServer) EvaluateTransaction(ctx context.Context, req *pb.TransactionRequest) (*pb.EvaluationResponse, error) {
-	start := time.Now()
+	inicio := time.Now()
 
-	// Control de admisión (early admission drop). Va ANTES de cualquier
-	// trabajo: si no hay tiempo, no gastamos CPU en algo que llegaría tarde.
-	//
-	// Todo cliente debe fijar un deadline. Si no lo hizo es un bug del
-	// cliente (rompe el contrato de los 200ms), así que se rechaza en vez de
-	// procesar "sin tiempo límite".
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		log.Printf("tx_id=%s rechazada: la llamada no trae deadline", req.TxId)
-		return nil, fallas.Nueva(codes.InvalidArgument, fallas.SinDeadline, "la llamada debe traer un deadline")
+	deadline, err := s.admitir(ctx)
+	if err != nil {
+		return nil, err
 	}
-
-	// D_rem = deadline - ahora. Si no alcanza para el trabajo mínimo, corte.
-	remaining := time.Until(deadline)
-	// Etapa 7: si este valor baja de ~200ms, hay espera ANTES del handler.
-	s.metricas.DRemLlegada(remaining)
-	if !presupuesto.Admitir(remaining) {
-		log.Printf("tx_id=%s EARLY DROP: quedan %v, mínimo %v", req.TxId, remaining, presupuesto.MinParaAdmitir)
-		return nil, fallas.Nueva(codes.DeadlineExceeded, fallas.EarlyDrop,
-			fmt.Sprintf("deadline insuficiente: quedan %v, se necesitan al menos %v", remaining, presupuesto.MinParaAdmitir))
-	}
-
-	// Validación de la request: sin tarjeta o sin coordenadas no hay con qué
-	// evaluar. Es un error del cliente (InvalidArgument), no un fraude.
-	//
-	// tx_id es obligatorio desde la Etapa 3: es el miembro del ZSET de
-	// velocidad, y vacío haría que todos esos intentos se fundieran en uno.
-	if req.TxId == "" {
-		return nil, fallas.Nueva(codes.InvalidArgument, fallas.RequestInvalida, "falta tx_id")
-	}
-	if req.CardToken == "" {
-		return nil, fallas.Nueva(codes.InvalidArgument, fallas.RequestInvalida, "falta card_token")
-	}
-	if !mandatoria.CoordenadasValidas(req.Latitude, req.Longitude) {
-		return nil, fallas.Nueva(codes.InvalidArgument, fallas.RequestInvalida,
-			fmt.Sprintf("coordenadas inválidas o ausentes: (%v, %v)", req.Latitude, req.Longitude))
-	}
-	// Desde la Etapa 4: el scoring usa ln(monto), que no existe para montos
-	// <= 0. Se escribe !(x > 0) y no x <= 0 a propósito: NaN no es mayor ni
-	// menor que nada, así que !(NaN > 0) es true y también se rechaza.
-	if !(req.Amount > 0) {
-		return nil, fallas.Nueva(codes.InvalidArgument, fallas.RequestInvalida, fmt.Sprintf("amount inválido: %v", req.Amount))
-	}
-	if req.MerchantCategory == "" {
-		return nil, fallas.Nueva(codes.InvalidArgument, fallas.RequestInvalida, "falta merchant_category")
-	}
-
-	// rechazar arma la respuesta de fraude y la manda a Settlement. Un
-	// fraude NO es un error gRPC: el motor funcionó bien y decidió "no", así
-	// que va con código OK y el motivo en el cuerpo. Es una closure: ve ctx,
-	// req y start de esta función.
-	rechazar := func(motivo string, score float64) (*pb.EvaluationResponse, error) {
-		return s.liquidar(ctx, req, &pb.EvaluationResponse{
-			TxId:            req.TxId,
-			IsFraud:         true,
-			RejectionReason: motivo,
-			RiskScore:       score,
-		}, start)
+	if err := validar(req); err != nil {
+		return nil, err
 	}
 
 	// --- Fase mandatoria (M_i) ---
-	v := s.verificador
-	ahora := start
-
-	// Viaje 1 a Redis: registra el intento (ANTES de cualquier rechazo: la
-	// velocidad cuenta todos los intentos) y trae blacklist, intentos y
-	// posición previa, todo junto. Va con el ctx de la request: el deadline
-	// del cliente llega hasta Redis.
-	tMandatoria := time.Now()
-	res, err := v.Consultar(ctx, req.TxId, req.CardToken, req.MerchantCategory, req.Latitude, req.Longitude, ahora)
-	s.metricas.Fase(metricas.FaseMandatoria, time.Since(tMandatoria))
+	res, stats, err := s.consultar(ctx, req, inicio)
 	if err != nil {
-		return nil, fallaDeVerificacion(req.TxId, err)
+		return nil, err
 	}
-
-	// Estadísticas de la categoría (llegaron en el mismo viaje). Una
-	// categoría sin estadísticas es un error del cliente y se rechaza
-	// (fail-closed: sin estadísticas no hay cómo puntuar). Se rechaza
-	// aunque después la request fuera a degradarse.
-	//
-	// Nota: el intento ya quedó registrado en la ventana de velocidad (el
-	// ZADD iba en el mismo pipeline). Es aceptable: contar de más es el lado
-	// seguro.
-	stats, conocida, err := opcional.ParsearEstadisticas(res.StatsCategoria)
-	if err != nil {
-		return nil, fallaDeVerificacion(req.TxId, err) // datos corruptos en Redis
-	}
-	if !conocida {
-		return nil, fallas.Nueva(codes.InvalidArgument, fallas.CategoriaDesconocida, fmt.Sprintf("merchant_category desconocida: %q", req.MerchantCategory))
-	}
-
-	// 1. Blacklist.
-	if res.EnBlacklist {
-		log.Printf("tx_id=%s FRAUDE %s", req.TxId, motivoBlacklist)
-		return rechazar(motivoBlacklist, 0)
-	}
-
-	// 2. Control de velocidad (card testing).
-	if res.Intentos > mandatoria.MaxIntentos {
-		log.Printf("tx_id=%s FRAUDE %s: %d intentos en %v", req.TxId, motivoCardTesting, res.Intentos, mandatoria.VentanaVelocidad)
-		return rechazar(motivoCardTesting, 0)
-	}
-
-	// 3. Viaje imposible.
-	if res.HayPrevia && res.Kmh > mandatoria.VelocidadMaxKmh {
-		log.Printf("tx_id=%s FRAUDE %s: %.0f km/h", req.TxId, motivoViajeImposible, res.Kmh)
-		return rechazar(motivoViajeImposible, 0)
+	if motivo := mandatoria.Evaluar(res); motivo != "" {
+		if registro.Depurando(ctx) {
+			slog.DebugContext(ctx, "fraude", "tx_id", req.TxId, "motivo", motivo,
+				"intentos", res.Intentos, "kmh", res.Kmh)
+		}
+		return s.liquidar(ctx, req, rechazo(req, motivo, 0), inicio)
 	}
 
 	// --- Fase opcional (O_i) ---
-	// D_rem se recalcula ACÁ: lo que importa es cuánto queda ahora, con la
-	// mandatoria y el viaje a Redis ya pagados.
-	dRem := time.Until(deadline)
-	s.metricas.Slack(presupuesto.Slack(dRem))
-	var riskScore float64
-	degradada := !presupuesto.CorreOpcional(dRem)
-
-	if degradada {
-		// Sin slack: se responde solo con la mandatoria. Se acepta el riesgo
-		// de no haber corrido el scoring a cambio de cumplir el deadline.
-		log.Printf("tx_id=%s DEGRADADA: quedan %v, slack %v", req.TxId, dRem, presupuesto.Slack(dRem))
-	} else {
-		tOpcional := time.Now()
-		riskScore = opcional.Puntuar(req.Amount, stats, s.iteraciones)
-		s.metricas.Fase(metricas.FaseOpcional, time.Since(tOpcional))
-		if riskScore > opcional.UmbralRechazo {
-			log.Printf("tx_id=%s FRAUDE %s: score %.3f", req.TxId, motivoRiesgoAlto, riskScore)
-			return rechazar(motivoRiesgoAlto, riskScore)
+	score, degradada := s.faseOpcional(ctx, req, stats, deadline)
+	if score > opcional.UmbralRechazo {
+		if registro.Depurando(ctx) {
+			slog.DebugContext(ctx, "fraude", "tx_id", req.TxId, "motivo", opcional.MotivoRiesgoAlto, "score", score)
 		}
+		return s.liquidar(ctx, req, rechazo(req, opcional.MotivoRiesgoAlto, score), inicio)
 	}
 
 	// Pasó todos los chequeos: recién ahora esta posición pasa a ser
-	// confiable (viaje 2 a Redis). Va DESPUÉS de la opcional: un rechazo por
-	// riesgo tampoco puede mover la tarjeta. Si no se puede guardar, no se
-	// aprueba: la próxima transacción de esta tarjeta se compararía contra
-	// una posición vieja y el chequeo de viaje imposible quedaría debilitado.
-	//
-	// Va ANTES de Settlement: la posición ya es confiable (pasó los
-	// chequeos de fraude) aunque Settlement falle por infraestructura. Al
-	// revés sería peor: Settlement comprometería la transacción y, si
-	// después fallara este SET, le diríamos "error" al cliente sobre una
-	// transacción ya comprometida.
-	if err := v.ActualizarPosicion(ctx, req.CardToken, req.Latitude, req.Longitude, ahora); err != nil {
+	// confiable (viaje 2 a Redis). Va DESPUÉS de la opcional (un rechazo por
+	// riesgo tampoco puede mover la tarjeta) y ANTES de Settlement (si no, un
+	// fallo de este SET después de un commit daría "error" sobre algo ya
+	// comprometido). Ver ADR-0006.
+	if err := s.verificador.ActualizarPosicion(ctx, req.CardToken, req.Latitude, req.Longitude, inicio); err != nil {
 		return nil, fallaDeVerificacion(req.TxId, err)
 	}
-
-	log.Printf("tx_id=%s card=%s amount=%.2f score=%.3f degradada=%v -> APROBADA por el motor",
-		req.TxId, req.CardToken, req.Amount, riskScore, degradada)
-
+	if registro.Depurando(ctx) {
+		slog.DebugContext(ctx, "aprobada por el motor", "tx_id", req.TxId, "score", score, "degradada", degradada)
+	}
 	return s.liquidar(ctx, req, &pb.EvaluationResponse{
 		TxId:       req.TxId,
-		IsFraud:    false,
-		RiskScore:  riskScore,
+		RiskScore:  score,
 		IsDegraded: degradada,
-	}, start)
+	}, inicio)
 }
 
-// liquidar manda la decisión a Settlement y arma la respuesta final.
+// admitir es el control de admisión (ADR-0003): va ANTES de cualquier
+// trabajo. Si no queda tiempo para lo mínimo, se rechaza en el acto (load
+// shedding). Devuelve el deadline de la request.
+//
+// Una llamada sin deadline se rechaza: es un bug del cliente, y procesarla
+// "sin límite" lo taparía (ADR-0002).
+func (s *fraudEngineServer) admitir(ctx context.Context) (time.Time, error) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return time.Time{}, fallas.Nueva(codes.InvalidArgument, fallas.SinDeadline, "la llamada debe traer un deadline")
+	}
+	restante := time.Until(deadline) // D_rem
+	// Si este valor baja de ~200ms, hay espera ANTES del handler.
+	s.metricas.DRemLlegada(restante)
+	if !presupuesto.Admitir(restante) {
+		return time.Time{}, fallas.Nueva(codes.DeadlineExceeded, fallas.EarlyDrop,
+			fmt.Sprintf("deadline insuficiente: quedan %v, se necesitan al menos %v", restante, presupuesto.MinParaAdmitir))
+	}
+	return deadline, nil
+}
+
+// validar rechaza las requests con las que no se puede decidir (ADR-0007).
+// Es un error del cliente (InvalidArgument), no un fraude. Función pura.
+func validar(req *pb.TransactionRequest) error {
+	invalida := func(msg string) error {
+		return fallas.Nueva(codes.InvalidArgument, fallas.RequestInvalida, msg)
+	}
+	switch {
+	case req.TxId == "":
+		// Es el miembro del ZSET de velocidad y la clave de idempotencia.
+		return invalida("falta tx_id")
+	case req.CardToken == "":
+		return invalida("falta card_token")
+	case !mandatoria.CoordenadasValidas(req.Latitude, req.Longitude):
+		return invalida(fmt.Sprintf("coordenadas inválidas o ausentes: (%v, %v)", req.Latitude, req.Longitude))
+	case !(req.Amount > 0):
+		// El scoring usa ln(monto). !(x > 0) y no x <= 0 a propósito: NaN no
+		// es mayor ni menor que nada, así que !(NaN > 0) también rechaza.
+		return invalida(fmt.Sprintf("amount inválido: %v", req.Amount))
+	case req.MerchantCategory == "":
+		return invalida("falta merchant_category")
+	default:
+		return nil
+	}
+}
+
+// consultar hace el viaje 1 a Redis: registra el intento (antes de
+// cualquier rechazo: la velocidad cuenta todos los intentos, ADR-0006) y
+// trae blacklist, intentos, posición previa y las estadísticas de la
+// categoría. Va con el ctx de la request: el deadline del cliente llega
+// hasta Redis.
+func (s *fraudEngineServer) consultar(ctx context.Context, req *pb.TransactionRequest, ahora time.Time) (mandatoria.Resultado, opcional.Estadisticas, error) {
+	t := time.Now()
+	res, err := s.verificador.Consultar(ctx, req.TxId, req.CardToken, req.MerchantCategory, req.Latitude, req.Longitude, ahora)
+	s.metricas.Fase(metricas.FaseMandatoria, time.Since(t))
+	if err != nil {
+		return res, opcional.Estadisticas{}, fallaDeVerificacion(req.TxId, err)
+	}
+
+	// Una categoría sin estadísticas se rechaza aunque la request fuera a
+	// degradarse: sin estadísticas no hay cómo puntuar. El intento ya quedó
+	// contado en la ventana (el ZADD iba en el mismo pipeline): contar de más
+	// es el lado seguro.
+	stats, conocida, err := opcional.ParsearEstadisticas(res.StatsCategoria)
+	if err != nil {
+		return res, stats, fallaDeVerificacion(req.TxId, err) // datos corruptos en Redis
+	}
+	if !conocida {
+		return res, stats, fallas.Nueva(codes.InvalidArgument, fallas.CategoriaDesconocida,
+			fmt.Sprintf("merchant_category desconocida: %q", req.MerchantCategory))
+	}
+	return res, stats, nil
+}
+
+// faseOpcional decide con el slack si corre el scoring (ADR-0004) y, si
+// corre, devuelve el score. D_rem se recalcula ACÁ: importa cuánto queda
+// ahora, con la mandatoria y el viaje a Redis ya pagados. Sin slack, la
+// respuesta sale degradada (solo mandatoria): se acepta el riesgo de no
+// haber puntuado a cambio de cumplir el deadline.
+func (s *fraudEngineServer) faseOpcional(ctx context.Context, req *pb.TransactionRequest, stats opcional.Estadisticas, deadline time.Time) (score float64, degradada bool) {
+	restante := time.Until(deadline)
+	slack := presupuesto.Slack(restante)
+	s.metricas.Slack(slack)
+	if !presupuesto.CorreOpcional(restante) {
+		if registro.Depurando(ctx) {
+			slog.DebugContext(ctx, "degradada", "tx_id", req.TxId, "restante", restante, "slack", slack)
+		}
+		return 0, true
+	}
+	t := time.Now()
+	score = opcional.Puntuar(req.Amount, stats, s.iteraciones)
+	s.metricas.Fase(metricas.FaseOpcional, time.Since(t))
+	return score, false
+}
+
+// rechazo arma la respuesta de un fraude. Un fraude NO es un error gRPC: el
+// motor funcionó bien y decidió "no", así que va con código OK y el motivo
+// en el cuerpo (ADR-0005).
+func rechazo(req *pb.TransactionRequest, motivo string, score float64) *pb.EvaluationResponse {
+	return &pb.EvaluationResponse{
+		TxId:            req.TxId,
+		IsFraud:         true,
+		RejectionReason: motivo,
+		RiskScore:       score,
+	}
+}
+
+// liquidar manda la decisión a Settlement y arma la respuesta final
+// (ADR-0012).
 //
 // La llamada tiene su propio timeout: ReservaSettleNet (C_settle + C_net),
 // lo que el slack ya le reserva. context.WithTimeout NUNCA alarga el
 // deadline: si al ctx de la request le queda menos, gana el que vence
-// primero. Así no nos quedamos esperando si Settlement se cuelga, y el
-// deadline del cliente se sigue respetando.
+// primero.
 //
 // Política ante una falla de Settlement:
-//   - Aprobada: fail-closed. Sin commit confirmado no se responde "aprobada":
-//     error gRPC.
+//   - Aprobada: fail-closed. Sin commit confirmado no se responde "aprobada".
 //   - Rechazada: la decisión de rechazar ya es la segura. Se responde igual
-//     el rechazo y se deja en el log que se perdió el registro de auditoría.
-func (s *fraudEngineServer) liquidar(ctx context.Context, req *pb.TransactionRequest, eval *pb.EvaluationResponse, start time.Time) (*pb.EvaluationResponse, error) {
+//     y queda en el log que se perdió el registro.
+func (s *fraudEngineServer) liquidar(ctx context.Context, req *pb.TransactionRequest, eval *pb.EvaluationResponse, inicio time.Time) (*pb.EvaluationResponse, error) {
 	ctxSettle, cancel := context.WithTimeout(ctx, presupuesto.ReservaSettleNet)
 	defer cancel()
 
 	var trailer metadata.MD
-	t0 := time.Now()
+	t := time.Now()
 	sr, err := s.settle.CommitTransaction(ctxSettle, &pb.SettlementRequest{
 		TxId:                req.TxId,
 		UserId:              req.UserId,
@@ -297,50 +286,53 @@ func (s *fraudEngineServer) liquidar(ctx context.Context, req *pb.TransactionReq
 		Evaluation:          eval,
 		EmissionTimestampNs: req.EmissionTimestampNs,
 	}, grpc.Trailer(&trailer))
-	total := time.Since(t0)
-	s.metricas.Fase(metricas.FaseSettlement, total)
+	total := time.Since(t)
+	s.medirSettlement(total, trailer)
 
-	// Medición de C_settle y C_net (ver internal/settlement).
-	if cSettle, ok := leerCSettle(trailer); ok {
-		s.metricas.Fase(metricas.FaseCSettle, cSettle)
-		s.metricas.Fase(metricas.FaseCNet, total-cSettle)
-		log.Printf("tx_id=%s settlement: total=%v c_settle=%v c_net=%v", req.TxId, total, cSettle, total-cSettle)
-	} else {
-		log.Printf("tx_id=%s settlement: total=%v (sin trailer)", req.TxId, total)
-	}
-
-	eval.ProcessingTimeMs = time.Since(start).Milliseconds()
+	eval.ProcessingTimeMs = time.Since(inicio).Milliseconds()
 
 	if err != nil {
 		if eval.IsFraud {
-			log.Printf("tx_id=%s REGISTRO PERDIDO (rechazo respondido igual): %v", req.TxId, err)
+			slog.WarnContext(ctx, "registro perdido: el rechazo se responde igual", "tx_id", req.TxId, "error", err)
 			return eval, nil
 		}
-		return nil, fallaDeSettlement(req.TxId, err)
+		return nil, fallaDeSettlement(ctx, req.TxId, err)
 	}
+	return respuestaSegunRegistro(ctx, req.TxId, eval, sr)
+}
 
-	// Manda lo REGISTRADO, no la evaluación de este intento: en un reintento
-	// (mismo tx_id) Settlement devuelve el primer resultado final, que puede
-	// diferir si algo cambió entre medio (por ejemplo, la tarjeta entró en
-	// la blacklist). Si la plata ya se comprometió, decirle "fraude" al
-	// cliente sería mentirle.
+// medirSettlement registra la duración de la llamada y, si vino el trailer,
+// la separa en C_settle (adentro de Settlement) y C_net (red + gRPC).
+func (s *fraudEngineServer) medirSettlement(total time.Duration, trailer metadata.MD) {
+	s.metricas.Fase(metricas.FaseSettlement, total)
+	if cSettle, ok := leerCSettle(trailer); ok {
+		s.metricas.Fase(metricas.FaseCSettle, cSettle)
+		s.metricas.Fase(metricas.FaseCNet, total-cSettle)
+	}
+}
+
+// respuestaSegunRegistro devuelve lo REGISTRADO por Settlement, no la
+// evaluación de este intento: en un reintento (mismo tx_id) Settlement
+// devuelve el primer resultado final, que puede diferir si algo cambió entre
+// medio (por ejemplo, la tarjeta entró en la blacklist). Si la plata ya se
+// comprometió, decirle "fraude" al cliente sería mentirle (ADR-0013).
+func respuestaSegunRegistro(ctx context.Context, txID string, eval *pb.EvaluationResponse, sr *pb.SettlementResponse) (*pb.EvaluationResponse, error) {
 	switch sr.Status {
 	case pb.TxStatus_STATUS_COMMITTED:
 		if eval.IsFraud {
-			log.Printf("tx_id=%s REINTENTO: ya estaba COMPROMETIDA (esta evaluación daba %s)", req.TxId, eval.RejectionReason)
+			slog.InfoContext(ctx, "reintento: ya estaba comprometida", "tx_id", txID, "evaluado", eval.RejectionReason)
 			eval.IsFraud, eval.RejectionReason = false, ""
 		}
-		log.Printf("tx_id=%s COMPROMETIDA latencia_e2e=%dms", req.TxId, sr.EndToEndLatencyMs)
 		return eval, nil
 	case pb.TxStatus_STATUS_REJECTED_FRAUD:
 		if !eval.IsFraud {
-			log.Printf("tx_id=%s REINTENTO: ya estaba RECHAZADA por %s", req.TxId, sr.Message)
+			slog.InfoContext(ctx, "reintento: ya estaba rechazada", "tx_id", txID, "motivo", sr.Message)
 			eval.IsFraud, eval.RejectionReason = true, sr.Message
 		}
 		return eval, nil
 	case pb.TxStatus_STATUS_ABORTED_TIMEOUT:
 		// Settlement vio que se pasó el deadline global: no comprometió.
-		log.Printf("tx_id=%s ABORTADA por Settlement: latencia_e2e=%dms", req.TxId, sr.EndToEndLatencyMs)
+		slog.WarnContext(ctx, "abortada por Settlement: superó el deadline global", "tx_id", txID, "latencia_e2e_ms", sr.EndToEndLatencyMs)
 		if eval.IsFraud {
 			return eval, nil // el rechazo vale igual
 		}
@@ -368,121 +360,93 @@ func leerCSettle(trailer metadata.MD) (time.Duration, bool) {
 // error de una llamada gRPC es un *status*, no el error de context
 // original, así que errors.Is(err, context.DeadlineExceeded) NO funciona:
 // hay que mirar status.Code(err).
-func fallaDeSettlement(txID string, err error) error {
-	log.Printf("tx_id=%s SIN COMMIT: %v", txID, err)
+func fallaDeSettlement(ctx context.Context, txID string, err error) error {
+	slog.WarnContext(ctx, "sin commit", "tx_id", txID, "error", err)
 	if status.Code(err) == codes.DeadlineExceeded {
-		// AMBIGUO: pudo haberse comprometido igual (ver Etapa 5).
+		// AMBIGUO: pudo haberse comprometido igual (ADR-0013).
 		return fallas.Nueva(codes.DeadlineExceeded, fallas.SettlementTimeout, "se agotó el tiempo esperando a Settlement")
 	}
 	return fallas.Nueva(codes.Unavailable, fallas.SettlementNoDisponible, "no se pudo comprometer la transacción")
 }
 
-// fallaDeVerificacion traduce un error de Redis a un código gRPC. En los
-// dos casos es fail-closed: no se aprueba lo que no se pudo verificar. No es
-// un fraude (is_fraud): es que el motor NO PUDO decidir.
+// fallaDeVerificacion traduce un error de Redis a un código gRPC. Es
+// fail-closed: no se aprueba lo que no se pudo verificar. No es un fraude:
+// es que el motor NO PUDO decidir (ADR-0009).
 func fallaDeVerificacion(txID string, err error) error {
-	log.Printf("tx_id=%s SIN VERIFICAR: %v", txID, err)
-	// Se acabó el deadline de la request mientras esperábamos a Redis.
+	slog.Warn("sin verificar", "tx_id", txID, "error", err)
 	if errors.Is(err, context.DeadlineExceeded) {
 		return fallas.Nueva(codes.DeadlineExceeded, fallas.RedisTimeout, "se agotó el deadline verificando la transacción")
 	}
-	// Redis caído o inalcanzable.
 	return fallas.Nueva(codes.Unavailable, fallas.RedisNoDisponible, "no se pudo verificar la transacción")
 }
 
 func main() {
+	if err := registro.Configurar("fraud_engine"); err != nil {
+		registro.Fatal("configuración de logs inválida", "error", err)
+	}
 	cfg, err := leerConfiguracion()
 	if err != nil {
 		// Mejor no arrancar que correr con una configuración que no es la
 		// que se pidió.
-		log.Fatalf("configuración inválida: %v", err)
+		registro.Fatal("configuración inválida", "error", err)
 	}
-	log.Printf("configuración: grpc=%s metricas=%q redis=%s settlement=%s iteraciones=%d apagado=%v aviso=%v",
-		cfg.grpcAddr, cfg.metricasAddr, cfg.redisAddr, cfg.settlementAddr, cfg.iteraciones, cfg.esperaApagado, cfg.avisoApagado)
+	slog.Info("configuración", "grpc", cfg.grpcAddr, "metricas", cfg.metricasAddr, "redis", cfg.redisAddr,
+		"prefijo", cfg.redisPrefijo, "settlement", cfg.settlementAddr, "iteraciones", cfg.iteraciones,
+		"apagado", cfg.esperaApagado, "aviso", cfg.avisoApagado)
 
-	// Señal de apagado: SIGTERM (lo que manda un orquestador: Compose, ECS)
-	// o Ctrl+C. ctx se cancela cuando llega cualquiera de las dos.
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	ctx, stop := servicio.ContextoDeApagado()
 	defer stop()
-	go func() {
-		<-ctx.Done()
-		// Después de la primera señal se restaura el comportamiento normal:
-		// un segundo Ctrl+C mata el proceso en el acto.
-		stop()
-	}()
 
-	// Cliente de Redis (configuración del hot path: respeta el deadline del
-	// ctx y no reintenta; ver redisclient.Nuevo). Los defer de los clientes
-	// corren DESPUÉS de servicio.Correr: las requests en vuelo los necesitan
-	// hasta el final del apagado.
-	rdb := redisclient.Nuevo(cfg.redisAddr)
-	defer rdb.Close()
-
-	// PING al arrancar: si Redis no está, el server no arranca. Fail-closed
-	// desde el inicio: mejor no atender que atender sin poder verificar.
-	//
-	// Acá SÍ va context.Background(): esto no es el hot path, no hay
-	// request entrante de la que heredar un deadline. Le ponemos uno propio
-	// para no quedarnos colgados si Redis no responde.
-	ctxPing, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	err = rdb.Ping(ctxPing).Err()
-	cancel()
+	// Los defer de los clientes corren DESPUÉS de servicio.Correr: las
+	// requests en vuelo los necesitan hasta el final del apagado.
+	rdb, err := redisclient.Conectar(ctx, cfg.redisAddr)
 	if err != nil {
-		log.Fatalf("no pude conectar a Redis en %s: %v", cfg.redisAddr, err)
+		registro.Fatal("no se pudo conectar a Redis", "error", err)
 	}
-	log.Printf("conectado a Redis en %s", cfg.redisAddr)
+	defer rdb.Close()
 
 	lis, err := net.Listen("tcp", cfg.grpcAddr)
 	if err != nil {
-		log.Fatalf("no pude escuchar en %s: %v", cfg.grpcAddr, err)
+		registro.Fatal("no se pudo escuchar", "addr", cfg.grpcAddr, "error", err)
 	}
 
 	// Cliente de Settlement. NewClient no conecta todavía; Connect() arranca
 	// la conexión en segundo plano para que la primera transacción no pague
-	// el costo de conectar (cold start). Si Settlement no está, no impide
-	// arrancar: cada transacción que lo necesite falla rápido (fail-closed).
+	// el costo de conectar. Si Settlement no está, el motor arranca igual:
+	// cada transacción que lo necesite falla rápido (fail-closed).
 	connSettle, err := grpc.NewClient(cfg.settlementAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		log.Fatalf("cliente de Settlement: %v", err)
+		registro.Fatal("cliente de Settlement", "error", err)
 	}
 	defer connSettle.Close()
 	connSettle.Connect()
 
-	// Métricas (Etapa 7): registro propio, expuesto en /metrics.
+	// Métricas (ADR-0015): registro propio, expuesto en /metrics. El
+	// interceptor mide cada llamada; las decisiones salen de la respuesta.
 	reg := metricas.NuevoRegistro()
 	rpc := metricas.NuevoRPC(reg, "fraud_engine")
 	motor := metricas.NuevoMotor(reg)
-	var srvMetricas *http.Server
-	if cfg.metricasAddr != "" {
-		srvMetricas = metricas.Servir(cfg.metricasAddr, reg)
-		log.Printf("métricas en %s/metrics", cfg.metricasAddr)
-	}
+	srvMetricas := metricas.Servir(cfg.metricasAddr, reg)
 
-	// El interceptor envuelve cada llamada: tasa, errores por motivo,
-	// latencia, en vuelo, tardías. Las decisiones salen de la respuesta.
 	grpcServer := grpc.NewServer(grpc.UnaryInterceptor(rpc.Interceptor(func(resp any) {
 		if r, ok := resp.(*pb.EvaluationResponse); ok {
 			motor.Decision(r.IsFraud, r.RejectionReason, r.IsDegraded)
 		}
 	})))
-	// La blacklist ya no está en el código: es el SET drts:blacklist en
-	// Redis (se carga con SADD, ver docs/GUIA-GO.md).
-	verificador := mandatoria.NuevoVerificador(rdb, "drts:")
 	pb.RegisterFraudEngineServer(grpcServer, &fraudEngineServer{
-		verificador: verificador,
+		verificador: mandatoria.NuevoVerificador(rdb, cfg.redisPrefijo),
 		settle:      pb.NewSettlementClient(connSettle),
 		iteraciones: cfg.iteraciones,
 		metricas:    motor,
 	})
-
-	// Salud estándar de gRPC (para Compose, ECS y k3s). Se registra acá, con
-	// Redis ya verificado: SERVING = listo para atender.
+	// Salud estándar de gRPC (ADR-0020), con Redis ya verificado: SERVING =
+	// listo para atender.
 	salud := servicio.NuevaSalud(grpcServer)
 
-	log.Printf("fraud-engine escuchando en %s", cfg.grpcAddr)
+	slog.Info("fraud-engine escuchando", "addr", cfg.grpcAddr)
 	plazos := servicio.Plazos{Aviso: cfg.avisoApagado, Espera: cfg.esperaApagado}
 	if err := servicio.Correr(ctx, grpcServer, lis, salud, srvMetricas, plazos); err != nil {
-		log.Printf("fraud-engine: %v", err)
+		slog.Warn("fraud-engine", "error", err)
 	}
-	log.Printf("fraud-engine apagado")
+	slog.Info("fraud-engine apagado")
 }

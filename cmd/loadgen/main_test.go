@@ -27,9 +27,13 @@ func TestClasificar(t *testing.T) {
 		{"early drop", fallas.Nueva(codes.DeadlineExceeded, fallas.EarlyDrop, "x"), catEarlyDrop, fallas.EarlyDrop},
 		// Mismo código que el early drop: solo el motivo los distingue.
 		{"timeout de Settlement: ambigua", fallas.Nueva(codes.DeadlineExceeded, fallas.SettlementTimeout, "x"), catAmbigua, fallas.SettlementTimeout},
+		{"Settlement no disponible: ambigua", fallas.Nueva(codes.Unavailable, fallas.SettlementNoDisponible, "x"), catAmbigua, fallas.SettlementNoDisponible},
 		{"timer del cliente: deadline miss", status.Error(codes.DeadlineExceeded, "context deadline exceeded"), catDeadline, "TIMEOUT_DEL_CLIENTE"},
 		{"Redis caído: error con motivo", fallas.Nueva(codes.Unavailable, fallas.RedisNoDisponible, "x"), catError, fallas.RedisNoDisponible},
-		{"error sin motivo: el código", status.Error(codes.Unavailable, "x"), catError, "Unavailable"},
+		// Unavailable sin motivo: la conexión falló del lado del cliente.
+		// Pudo haberse procesado: ambiguo, se reintenta (ADR-0022).
+		{"conexión caída: ambigua", status.Error(codes.Unavailable, "x"), catAmbigua, "CONEXION_CAIDA"},
+		{"error sin motivo: el código", status.Error(codes.Internal, "x"), catError, "Internal"},
 		{"error que no es gRPC", errors.New("x"), catError, "Unknown"},
 	}
 	for _, c := range casos {

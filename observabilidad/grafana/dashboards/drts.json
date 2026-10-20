@@ -1,7 +1,7 @@
 {
   "uid": "drts",
   "title": "D-RTS — Tiempo real",
-  "description": "Fraud-Engine, Settlement y load-generator del D-RTS (Etapa 7).",
+  "description": "Fraud-Engine, Settlement y load-generator del D-RTS",
   "tags": [
     "drts"
   ],
@@ -115,7 +115,7 @@
     {
       "type": "timeseries",
       "title": "Carga ofrecida vs goodput",
-      "description": "Ofrecida: transacciones que lanza el loadgen por segundo. Goodput: las que terminaron PROCESSED (decisión a tiempo) por segundo. Mientras van juntas, el sistema da abasto. Si la ofrecida sube y el goodput BAJA, es colapso por congestión (Etapa 6): un buen load shedding debería aplanar el goodput en la capacidad, no desplomarlo.",
+      "description": "Ofrecida: transacciones que lanza el loadgen por segundo. Goodput: las que terminaron PROCESSED (decisión a tiempo) por segundo. Mientras van juntas, el sistema da abasto. Si la ofrecida sube y el goodput BAJA, es colapso por congestión (ADR-0003): un buen load shedding debería aplanar el goodput en la capacidad, no desplomarlo.",
       "id": 3,
       "datasource": {
         "type": "prometheus",
@@ -202,7 +202,7 @@
     {
       "type": "timeseries",
       "title": "Resultados por categoría",
-      "description": "Clasificación del primer intento de cada transacción (Etapa 6): PROCESSED, EARLY_DROP (la admisión la rechazó), DEADLINE_MISS (no hubo respuesta en 200ms), AMBIGUOUS (timeout de Settlement: pudo haberse comprometido; el loadgen reintenta con el mismo tx_id), ERROR.",
+      "description": "Clasificación del primer intento de cada transacción (ADR-0014): PROCESSED, EARLY_DROP (la admisión la rechazó), DEADLINE_MISS (no hubo respuesta en 200ms), AMBIGUOUS (timeout de Settlement o conexión caída: pudo haberse comprometido; el loadgen reintenta con el mismo tx_id, ADR-0013/0022), ERROR.",
       "id": 4,
       "datasource": {
         "type": "prometheus",
@@ -467,7 +467,7 @@
     {
       "type": "timeseries",
       "title": "Requests en vuelo (servidor)",
-      "description": "Cuántas requests está atendiendo el engine en este instante. No hay cola: cada request es una goroutine que arranca ya y todas comparten el CPU (processor sharing). Si esto sube mucho, cada una tarda más y todas vencen juntas: la firma del colapso de la Etapa 6.",
+      "description": "Cuántas requests está atendiendo el engine en este instante. No hay cola: cada request es una goroutine que arranca ya y todas comparten el CPU (processor sharing). Si esto sube mucho, cada una tarda más y todas vencen juntas: la firma del colapso por congestión (ADR-0003).",
       "id": 8,
       "datasource": {
         "type": "prometheus",
@@ -682,7 +682,7 @@
     {
       "type": "timeseries",
       "title": "D_rem al llegar",
-      "description": "Cuánto le queda a cada request al llegar al handler, antes de la admisión. P1 = el 1% con menos tiempo. Hoy ronda los 200ms siempre: no hay espera antes del handler, por eso la admisión casi nunca actúa. La línea roja es el mínimo para admitir (35ms). Con un pool de workers (Etapa 10) la espera en la cola va a hacer bajar esto.",
+      "description": "Cuánto le queda a cada request al llegar al handler, antes de la admisión. P1 = el 1% con menos tiempo. Hoy ronda los 200ms siempre: no hay espera antes del handler, por eso la admisión casi nunca actúa. La línea roja es el mínimo para admitir (35ms). Con un pool de workers (planificado) la espera en la cola va a hacer bajar esto.",
       "id": 11,
       "datasource": {
         "type": "prometheus",
@@ -1057,7 +1057,7 @@
     {
       "type": "timeseries",
       "title": "Estados registrados",
-      "description": "Lo que Settlement registró: COMMITTED, REJECTED_FRAUD, ABORTED_TIMEOUT (llegó después del deadline global: no se compromete nada). En un reintento gana el primer resultado final (Etapa 5).",
+      "description": "Lo que Settlement registró: COMMITTED, REJECTED_FRAUD, ABORTED_TIMEOUT (llegó después del deadline global: no se compromete nada). En un reintento gana el primer resultado final (ADR-0013).",
       "id": 17,
       "datasource": {
         "type": "prometheus",
@@ -1204,7 +1204,7 @@
     },
     {
       "type": "row",
-      "title": "4 · Runtime de Go y CPU (pistas para la Etapa 10)",
+      "title": "4 · Runtime de Go y CPU (pistas para la calibración)",
       "collapsed": false,
       "id": 19,
       "gridPos": {
@@ -1218,7 +1218,7 @@
     {
       "type": "timeseries",
       "title": "CPU por proceso (núcleos)",
-      "description": "Núcleos de CPU que usa cada proceso (rate de process_cpu_seconds_total). La suma contra los hilos de la máquina dice si el CPU está saturado. En la Etapa 6 el colapso empezó antes de 700 RPS: acá se ve por qué.",
+      "description": "Núcleos de CPU que usa cada proceso (rate de process_cpu_seconds_total). La suma contra los hilos de la máquina dice si el CPU está saturado. En la máquina de desarrollo el colapso empezó antes de 700 RPS: acá se ve por qué.",
       "id": 20,
       "datasource": {
         "type": "prometheus",
@@ -1295,7 +1295,7 @@
     {
       "type": "timeseries",
       "title": "Pausa máxima del garbage collector",
-      "description": "La pausa más larga del GC (stop-the-world) en la ventana reciente, por proceso. Sospechosa de la cola de Settlement (1 de cada ~500 llamadas pasaba de 15ms, Etapa 5). Se investiga en serio en la Etapa 10 con GODEBUG=gctrace=1.",
+      "description": "La pausa más larga del GC (stop-the-world) en la ventana reciente, por proceso. Sospechosa de la cola de Settlement (1 de cada ~500 llamadas pasaba de 15ms, ADR-0012). Se investiga en la calibración con GODEBUG=gctrace=1.",
       "id": 21,
       "datasource": {
         "type": "prometheus",

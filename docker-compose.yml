@@ -1,4 +1,4 @@
-# D-RTS en Docker Compose (Etapa 7.5). Tres grupos, con perfiles:
+# D-RTS en Docker Compose (ADR-0020). Tres grupos, con perfiles:
 #
 #   docker compose up -d                          # solo observabilidad
 #   docker compose --profile sistema up -d --build   # + Redis, Settlement, Fraud-Engine
@@ -20,9 +20,18 @@ x-build: &build
   context: .
   dockerfile: Dockerfile
 
+# Rotación de logs: por defecto Docker los guarda sin límite y, bajo carga,
+# llenan el disco. Como máximo 3 archivos de 10MB por servicio (ADR-0021).
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   # ---------------------------------------------------------------- sistema
   redis:
+    logging: *logging
     profiles: [sistema]
     image: redis:8.10.2
     # Sin snapshots a disco: un snapshot hace fork() del proceso, que puede
@@ -39,6 +48,7 @@ services:
 
   # Corre una vez y termina: carga las estadísticas del Z-score en Redis.
   cargar-stats:
+    logging: *logging
     profiles: [sistema]
     build: { <<: *build, target: cargar-stats }
     image: drts/cargar-stats:dev
@@ -49,11 +59,13 @@ services:
       redis: { condition: service_healthy }
 
   settlement:
+    logging: *logging
     profiles: [sistema]
     build: { <<: *build, target: settlement }
     image: drts/settlement:dev
     environment:
       REDIS_ADDR: redis:6379
+      LOG_NIVEL: info # debug: una línea por transacción (mucho volumen)
     healthcheck:
       # No hay shell en la imagen: el chequeo es el binario /salud (gRPC).
       test: ["CMD", "/salud", "-addr", "localhost:50052"]
@@ -65,12 +77,14 @@ services:
       redis: { condition: service_healthy }
 
   fraud-engine:
+    logging: *logging
     profiles: [sistema]
     build: { <<: *build, target: fraud-engine }
     image: drts/fraud-engine:dev
     environment:
       REDIS_ADDR: redis:6379
       SETTLEMENT_ADDR: settlement:50052
+      LOG_NIVEL: info # debug: una línea por transacción (mucho volumen)
       # ITERACIONES_SCORING: 10000000   # perilla de costo (default)
     healthcheck:
       test: ["CMD", "/salud", "-addr", "localhost:50051"]
@@ -84,10 +98,11 @@ services:
       cargar-stats: { condition: service_completed_successfully }
     # Sin límites de CPU/memoria por ahora: para comparar contra nativo en
     # igualdad de condiciones. Los límites (y el throttling que generan) se
-    # estudian en la Etapa 10.
+    # estudian en la calibración por entorno (ADR-0018).
 
   # ------------------------------------------------------------------ carga
   loadgen:
+    logging: *logging
     profiles: [carga]
     build: { <<: *build, target: loadgen }
     image: drts/loadgen:dev
@@ -106,6 +121,7 @@ services:
 
   # --------------------------------------------------------- observabilidad
   prometheus:
+    logging: *logging
     image: prom/prometheus:v3.15.0 # versión fija: el entorno se levanta igual siempre
     command:
       - --config.file=/etc/prometheus/prometheus.yml
@@ -123,6 +139,7 @@ services:
     restart: unless-stopped
 
   grafana:
+    logging: *logging
     image: grafana/grafana:13.2.3
     environment:
       # Entorno local de estudio: sin login (por eso el puerto va atado a

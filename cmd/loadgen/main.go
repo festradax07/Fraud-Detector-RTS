@@ -4,7 +4,7 @@
 //	go run ./cmd/loadgen -modo nominal               # 50 RPS, 30s
 //	go run ./cmd/loadgen -modo sobrecarga -duracion 60s
 //
-// Diseño (ver GUIA-GO, Etapa 6):
+// Diseño (ADR-0014):
 //   - LAZO ABIERTO: las llegadas siguen un proceso de Poisson y cada una sale
 //     en su propia goroutine, sin esperar a las anteriores. Un generador de
 //     lazo cerrado (N workers que esperan cada respuesta) afloja justo cuando
@@ -15,8 +15,9 @@
 //     (no usado para calcular las estadísticas), con una tarjeta ÚNICA por
 //     transacción: con 924 tarjetas reales, la compresión temporal haría que
 //     casi todo diera CARD_TESTING.
-//   - Ante SETTLEMENT_TIMEOUT (resultado ambiguo, Etapa 5) reintenta con el
-//     MISMO tx_id: el sistema es idempotente y converge al resultado real.
+//   - Ante un resultado ambiguo (timeout de Settlement, o la conexión que se
+//     cae a mitad de una request) reintenta con el MISMO tx_id: el sistema es
+//     idempotente y converge al resultado real (ADR-0013, ADR-0022).
 package main
 
 import (
@@ -26,7 +27,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
+	"math"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -44,6 +46,7 @@ import (
 
 	"fd_rts/internal/fallas"
 	"fd_rts/internal/metricas"
+	"fd_rts/internal/registro"
 	pb "fd_rts/proto"
 )
 
@@ -52,7 +55,7 @@ const (
 	catProcesada = "PROCESSED"     // hubo decisión a tiempo
 	catEarlyDrop = "EARLY_DROP"    // la admisión la rechazó
 	catDeadline  = "DEADLINE_MISS" // no llegó respuesta antes del deadline
-	catAmbigua   = "AMBIGUOUS"     // timeout de Settlement: pudo haberse comprometido
+	catAmbigua   = "AMBIGUOUS"     // resultado desconocido: pudo haberse comprometido
 	catError     = "ERROR"         // cualquier otro error
 )
 
@@ -98,12 +101,22 @@ func clasificar(err error) (cat, motivo string) {
 	switch {
 	case motivo == fallas.EarlyDrop:
 		return catEarlyDrop, motivo
-	case motivo == fallas.SettlementTimeout:
+	case motivo == fallas.SettlementTimeout, motivo == fallas.SettlementNoDisponible:
+		// El motor no supo si Settlement comprometió: un timeout, o la
+		// conexión entre ellos que se cayó con la request en vuelo. Ambiguo:
+		// se reintenta con el mismo tx_id (ADR-0013, ADR-0022).
 		return catAmbigua, motivo
 	case motivo == "" && status.Code(err) == codes.DeadlineExceeded:
 		// Sin motivo: lo generó el timer del propio cliente. El servidor no
 		// respondió a tiempo.
 		return catDeadline, "TIMEOUT_DEL_CLIENTE"
+	case motivo == "" && status.Code(err) == codes.Unavailable:
+		// Sin motivo: no lo armó el servidor, lo armó gRPC del lado del
+		// cliente porque la conexión falló. Si se cayó con la request en
+		// vuelo (por ejemplo, el motor murió), del otro lado pudo haberse
+		// comprometido: es ambiguo. Si ni siquiera llegó a mandarse, reintentar
+		// también es seguro (mismo tx_id, idempotente). ADR-0022.
+		return catAmbigua, "CONEXION_CAIDA"
 	case motivo == "":
 		return catError, status.Code(err).String()
 	default:
@@ -125,14 +138,8 @@ func percentil(ordenada []time.Duration, q float64) time.Duration {
 	if len(ordenada) == 0 {
 		return 0
 	}
-	pos := int(float64(len(ordenada))*q+0.999999999) - 1
-	if pos < 0 {
-		pos = 0
-	}
-	if pos >= len(ordenada) {
-		pos = len(ordenada) - 1
-	}
-	return ordenada[pos]
+	pos := int(math.Ceil(q*float64(len(ordenada)))) - 1
+	return ordenada[min(max(pos, 0), len(ordenada)-1)]
 }
 
 type generador struct {
@@ -143,7 +150,7 @@ type generador struct {
 	met         *metricasLoadgen
 }
 
-// metricasLoadgen: la vista del CLIENTE, en vivo (Etapa 7). Es la única que
+// metricasLoadgen: la vista del CLIENTE, en vivo (ADR-0015). Es la única que
 // ve los DEADLINE_MISS: el servidor cree que respondió bien.
 type metricasLoadgen struct {
 	ofrecidas   prometheus.Counter
@@ -254,35 +261,35 @@ func main() {
 	metricasAddr := flag.String("metricas", ":2114", "dónde exponer /metrics para Prometheus (vacío: no exponer)")
 	gracia := flag.Duration("gracia", 3*time.Second, "cuánto mantener /metrics abierto al terminar, para el último scrape")
 	flag.Parse()
+	if err := registro.Configurar("loadgen"); err != nil {
+		registro.Fatal("configuración de logs inválida", "error", err)
+	}
 
 	rps := *rpsFlag
 	if rps == 0 {
 		var ok bool
 		if rps, ok = modos[*modo]; !ok {
-			log.Fatalf("modo desconocido %q (nominal o sobrecarga)", *modo)
+			registro.Fatal("modo desconocido (nominal o sobrecarga)", "modo", *modo)
 		}
 	}
 
 	filas, err := leerFilas(*rutaCSV)
 	if err != nil {
-		log.Fatalf("leyendo %s: %v", *rutaCSV, err)
+		registro.Fatal("no se pudo leer el dataset", "csv", *rutaCSV, "error", err)
 	}
 
 	// Una sola conexión: HTTP/2 multiplexa todas las requests concurrentes
 	// sobre ella.
 	conn, err := grpc.NewClient(*target, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		log.Fatalf("cliente: %v", err)
+		registro.Fatal("cliente gRPC", "error", err)
 	}
 	defer conn.Close()
 
 	reg := metricas.NuevoRegistro()
 	met := nuevasMetricasLoadgen(reg)
 	met.rpsObjetivo.Set(rps)
-	if *metricasAddr != "" {
-		metricas.Servir(*metricasAddr, reg)
-		log.Printf("métricas en http://localhost%s/metrics", *metricasAddr)
-	}
+	metricas.Servir(*metricasAddr, reg) // "" = no exponer
 
 	inicio := time.Now()
 	g := &generador{
@@ -294,8 +301,7 @@ func main() {
 	}
 	calentar(g.cliente)
 
-	log.Printf("corrida %s: %.0f RPS durante %v (deadline %v), %d filas del dataset",
-		g.corrida, rps, *duracion, *deadline, len(filas))
+	slog.Info("corrida", "id", g.corrida, "rps", rps, "duracion", *duracion, "deadline", *deadline, "filas", len(filas))
 
 	// Los resultados llegan por un channel a UNA goroutine que los junta:
 	// así nadie más toca el slice y no hace falta mutex ("compartir memoria
@@ -348,14 +354,14 @@ func main() {
 		*salida = filepath.Join("resultados", fmt.Sprintf("loadgen-%s-%s.csv", *modo, inicio.Format("20060102-150405")))
 	}
 	if err := escribirCSV(*salida, todos); err != nil {
-		log.Fatalf("escribiendo %s: %v", *salida, err)
+		registro.Fatal("no se pudo escribir el CSV de resultados", "salida", *salida, "error", err)
 	}
-	log.Printf("resultados por transacción en %s", *salida)
+	slog.Info("resultados por transacción", "csv", *salida)
 
 	if *metricasAddr != "" && *gracia > 0 {
 		// Prometheus scrapea cada 1s: sin esta espera, lo último que pasó en
 		// la corrida podría no llegar a leerse antes de que el proceso muera.
-		log.Printf("manteniendo /metrics %v para el último scrape", *gracia)
+		slog.Info("manteniendo /metrics para el último scrape", "gracia", *gracia)
 		time.Sleep(*gracia)
 	}
 }

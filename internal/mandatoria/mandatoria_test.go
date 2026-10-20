@@ -5,13 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"fd_rts/internal/config"
+	"fd_rts/internal/pruebas"
 	"fd_rts/internal/redisclient"
 )
 
@@ -19,40 +18,11 @@ import (
 // Helpers: Redis real
 // ---------------------------------------------------------------------------
 
-var redisAddrTest = config.Texto("REDIS_ADDR", "localhost:6379") // REDIS_ADDR: para correr los tests desde un contenedor
-
-// verificadorDePrueba conecta al Redis REAL y usa un prefijo de claves único,
-// para que el test no pise datos del server ni de otros tests. Al terminar,
-// t.Cleanup borra todas las claves del prefijo.
-//
-// Si Redis no está levantado, el test FALLA (no se saltea): un test salteado
-// se ve como "ok" y esconde que falta la infraestructura.
+// verificadorDePrueba arma un Verificador sobre el Redis REAL, con un
+// prefijo de claves único que se limpia al terminar (internal/pruebas).
 func verificadorDePrueba(t *testing.T) *Verificador {
 	t.Helper()
-	rdb := redisclient.Nuevo(redisAddrTest)
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		rdb.Close()
-		t.Fatalf("Redis no disponible en %s (levantalo con: docker start redis-drts): %v", redisAddrTest, err)
-	}
-
-	prefijo := fmt.Sprintf("test:%d:%d:", os.Getpid(), time.Now().UnixNano())
-
-	// t.Cleanup corre al terminar el test, pase o falle (parecido a defer,
-	// pero registrado desde un helper).
-	t.Cleanup(func() {
-		ctx := context.Background()
-		// SCAN recorre TODA la base y después filtra por el patrón: con COUNT
-		// alto son menos viajes (con 100 y 200k claves eran ~2000 por test).
-		iter := rdb.Scan(ctx, 0, prefijo+"*", 10000).Iterator()
-		for iter.Next(ctx) {
-			rdb.Del(ctx, iter.Val())
-		}
-		rdb.Close()
-	})
-
+	rdb, prefijo := pruebas.Redis(t)
 	return NuevoVerificador(rdb, prefijo)
 }
 
@@ -153,7 +123,7 @@ func TestVentanaDeVelocidad(t *testing.T) {
 			{"tok-b", 2 * time.Second, 1},
 			{"tok-a", 3 * time.Second, 3},
 		}},
-		// Antes (Etapa 2) se guardaban timestamps en un slice: dos intentos
+		// Con timestamps en un slice (la primera versión, en memoria), dos intentos
 		// en el mismo instante contaban 2. Con el ZSET también, porque el
 		// miembro es el tx_id y no el timestamp.
 		{"dos intentos en el mismo ms cuentan 2", []intento{
@@ -192,10 +162,10 @@ func TestTxIDRepetidoNoSumaIntentos(t *testing.T) {
 	}
 }
 
-// En la Etapa 2 este test probaba el mutex. Ahora prueba que Redis ordena
+// Con el estado en memoria, este test probaba el mutex. Ahora prueba que Redis ordena
 // la concurrencia: 100 requests simultáneas, ningún intento perdido.
 //
-// Nota: goroutines y sync.WaitGroup son tema de la Etapa 6.
+// Goroutines + sync.WaitGroup: lo mínimo para generar concurrencia.
 func TestVelocidadConcurrente(t *testing.T) {
 	v := verificadorDePrueba(t)
 	const n = 100
@@ -336,6 +306,35 @@ func TestDeadlineLlegaARedis(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Funciones puras: sin Redis
 // ---------------------------------------------------------------------------
+
+// Las reglas de la mandatoria, sin Redis: el resultado de Consultar entra y
+// sale el motivo. El orden importa cuando se cumple más de una regla.
+func TestEvaluar(t *testing.T) {
+	casos := []struct {
+		nombre string
+		res    Resultado
+		want   string
+	}{
+		{"todo limpio", Resultado{Intentos: 1}, ""},
+		{"primera compra (sin previa)", Resultado{Intentos: 1, HayPrevia: false, Kmh: 99999}, ""},
+		{"blacklist", Resultado{EnBlacklist: true, Intentos: 1}, MotivoBlacklist},
+		{"justo el máximo de intentos: pasa", Resultado{Intentos: MaxIntentos}, ""},
+		{"un intento más que el máximo", Resultado{Intentos: MaxIntentos + 1}, MotivoCardTesting},
+		{"justo la velocidad máxima: pasa", Resultado{Intentos: 1, HayPrevia: true, Kmh: VelocidadMaxKmh}, ""},
+		{"más rápido que la máxima", Resultado{Intentos: 1, HayPrevia: true, Kmh: VelocidadMaxKmh + 1}, MotivoViajeImposible},
+		{"velocidad infinita", Resultado{Intentos: 1, HayPrevia: true, Kmh: math.Inf(1)}, MotivoViajeImposible},
+		// Varias reglas a la vez: gana la primera.
+		{"blacklist y card testing: blacklist", Resultado{EnBlacklist: true, Intentos: 10}, MotivoBlacklist},
+		{"card testing y viaje imposible: card testing", Resultado{Intentos: 10, HayPrevia: true, Kmh: 99999}, MotivoCardTesting},
+	}
+	for _, c := range casos {
+		t.Run(c.nombre, func(t *testing.T) {
+			if got := Evaluar(c.res); got != c.want {
+				t.Errorf("Evaluar(%+v) = %q, se esperaba %q", c.res, got, c.want)
+			}
+		})
+	}
+}
 
 // Los valores esperados salen de la geometría de la esfera, no de un mapa:
 // un arco de θ grados sobre un círculo máximo mide R·θ·π/180.

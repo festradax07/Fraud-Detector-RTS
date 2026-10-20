@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -21,38 +20,22 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
-	"fd_rts/internal/config"
 	"fd_rts/internal/fallas"
 	"fd_rts/internal/mandatoria"
 	"fd_rts/internal/metricas"
 	"fd_rts/internal/opcional"
 	"fd_rts/internal/presupuesto"
+	"fd_rts/internal/pruebas"
 	"fd_rts/internal/redisclient"
 	"fd_rts/internal/settlement"
 	pb "fd_rts/proto"
 )
 
-// levantarSettlement pone a escuchar srv en un puerto TCP real
-// (localhost:0: el sistema operativo elige uno libre) y devuelve un cliente
-// gRPC real apuntándole. Se apaga solo al terminar el test.
+// levantarSettlement pone a escuchar srv en un puerto TCP real y devuelve un
+// cliente gRPC real apuntándole (internal/pruebas).
 func levantarSettlement(t *testing.T, srv pb.SettlementServer) pb.SettlementClient {
 	t.Helper()
-	lis, err := net.Listen("tcp", "localhost:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	g := grpc.NewServer()
-	pb.RegisterSettlementServer(g, srv)
-	go g.Serve(lis) // Serve bloquea: va en su propia goroutine
-
-	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		t.Fatalf("cliente de Settlement: %v", err)
-	}
-	t.Cleanup(func() {
-		conn.Close()
-		g.Stop()
-	})
+	conn := pruebas.ServirGRPC(t, func(g *grpc.Server) { pb.RegisterSettlementServer(g, srv) })
 	return pb.NewSettlementClient(conn)
 }
 
@@ -71,10 +54,6 @@ func (s settlementLento) CommitTransaction(ctx context.Context, req *pb.Settleme
 	}
 	return s.Servidor.CommitTransaction(ctx, req)
 }
-
-// redisAddrTest: el Redis real de los tests. REDIS_ADDR permite apuntar a
-// otro (por ejemplo, desde un contenedor, donde Redis no está en localhost).
-var redisAddrTest = config.Texto("REDIS_ADDR", redisAddrPorDefecto)
 
 // Coordenadas de referencia para los tests.
 const (
@@ -113,26 +92,8 @@ func nuevoServerDePrueba(t *testing.T) *fraudEngineServer {
 // sobre los mismos datos.
 func nuevoServerConRedis(t *testing.T) (*fraudEngineServer, *redis.Client, string) {
 	t.Helper()
-	rdb := redisclient.Nuevo(redisAddrTest)
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		rdb.Close()
-		t.Fatalf("Redis no disponible en %s (levantalo con: docker start redis-drts): %v", redisAddrTest, err)
-	}
-
-	prefijo := fmt.Sprintf("test:%d:%d:", os.Getpid(), time.Now().UnixNano())
-	t.Cleanup(func() {
-		ctx := context.Background()
-		// SCAN recorre TODA la base y después filtra por el patrón: con COUNT
-		// alto son menos viajes (con 100 y 200k claves eran ~2000 por test).
-		iter := rdb.Scan(ctx, 0, prefijo+"*", 10000).Iterator()
-		for iter.Next(ctx) {
-			rdb.Del(ctx, iter.Val())
-		}
-		rdb.Close()
-	})
+	rdb, prefijo := pruebas.Redis(t)
+	ctx := context.Background()
 
 	v := mandatoria.NuevoVerificador(rdb, prefijo)
 	if err := v.Bloquear(ctx, "tok-robada"); err != nil {
@@ -255,31 +216,31 @@ func TestFaseMandatoria(t *testing.T) {
 			{txValida("t1", "tok-ok", baLat, baLon), ""},
 		}},
 		{"tarjeta en blacklist", []paso{
-			{txValida("t1", "tok-robada", baLat, baLon), motivoBlacklist},
+			{txValida("t1", "tok-robada", baLat, baLon), mandatoria.MotivoBlacklist},
 		}},
 		{"card testing: el 4.º intento se rechaza", []paso{
 			{txValida("t1", "tok-ok", baLat, baLon), ""},
 			{txValida("t2", "tok-ok", baLat, baLon), ""},
 			{txValida("t3", "tok-ok", baLat, baLon), ""},
-			{txValida("t4", "tok-ok", baLat, baLon), motivoCardTesting},
+			{txValida("t4", "tok-ok", baLat, baLon), mandatoria.MotivoCardTesting},
 		}},
 		{"viaje imposible: BA y al instante Moscú", []paso{
 			{txValida("t1", "tok-ok", baLat, baLon), ""},
-			{txValida("t2", "tok-ok", moscuLat, moscuLon), motivoViajeImposible},
+			{txValida("t2", "tok-ok", moscuLat, moscuLon), mandatoria.MotivoViajeImposible},
 		}},
 		// El rechazo desde Moscú no mueve la tarjeta: la vuelta a BA se
 		// compara contra BA (0 km/h) y se aprueba.
 		{"un rechazo no mueve la tarjeta", []paso{
 			{txValida("t1", "tok-ok", baLat, baLon), ""},
-			{txValida("t2", "tok-ok", moscuLat, moscuLon), motivoViajeImposible},
+			{txValida("t2", "tok-ok", moscuLat, moscuLon), mandatoria.MotivoViajeImposible},
 			{txValida("t3", "tok-ok", baLat, baLon), ""},
 		}},
 		// Los intentos rechazados también cuentan para la velocidad.
 		{"los rechazos suman intentos", []paso{
 			{txValida("t1", "tok-ok", baLat, baLon), ""},
-			{txValida("t2", "tok-ok", moscuLat, moscuLon), motivoViajeImposible},
-			{txValida("t3", "tok-ok", moscuLat, moscuLon), motivoViajeImposible},
-			{txValida("t4", "tok-ok", baLat, baLon), motivoCardTesting},
+			{txValida("t2", "tok-ok", moscuLat, moscuLon), mandatoria.MotivoViajeImposible},
+			{txValida("t3", "tok-ok", moscuLat, moscuLon), mandatoria.MotivoViajeImposible},
+			{txValida("t4", "tok-ok", baLat, baLon), mandatoria.MotivoCardTesting},
 		}},
 	}
 
@@ -353,9 +314,9 @@ func TestFaseOpcional(t *testing.T) {
 		wantScore    float64
 	}{
 		{"200ms, monto típico: corre la opcional y aprueba", 200 * time.Millisecond, montoConZ(0), false, "", false, 0},
-		{"200ms, monto anormalmente alto: RIESGO_ALTO", 200 * time.Millisecond, montoConZ(4), true, motivoRiesgoAlto, false, 1 - math.Pow(0.25, 16.0/9)},
+		{"200ms, monto anormalmente alto: RIESGO_ALTO", 200 * time.Millisecond, montoConZ(4), true, opcional.MotivoRiesgoAlto, false, 1 - math.Pow(0.25, 16.0/9)},
 		// z² mira para los dos lados: card testing con cargas chiquitas.
-		{"200ms, monto anormalmente bajo: RIESGO_ALTO", 200 * time.Millisecond, montoConZ(-4), true, motivoRiesgoAlto, false, 1 - math.Pow(0.25, 16.0/9)},
+		{"200ms, monto anormalmente bajo: RIESGO_ALTO", 200 * time.Millisecond, montoConZ(-4), true, opcional.MotivoRiesgoAlto, false, 1 - math.Pow(0.25, 16.0/9)},
 		// D_rem ≈ 99ms tras la mandatoria: slack ≈ 4ms ≥ 0, entra justo.
 		{"100ms: slack positivo, corre", 100 * time.Millisecond, montoConZ(0), false, "", false, 0},
 		// Pasa la admisión (≥ 35ms) pero no hay slack para la opcional.
@@ -395,7 +356,7 @@ func TestRechazoPorRiesgoNoMueveLaTarjeta(t *testing.T) {
 	s := nuevoServerDePrueba(t)
 
 	r1, err := evaluar(t, s, conMonto(txValida("t1", "tok-ok", baLat, baLon), montoConZ(4)))
-	if err != nil || r1.RejectionReason != motivoRiesgoAlto {
+	if err != nil || r1.RejectionReason != opcional.MotivoRiesgoAlto {
 		t.Fatalf("t1: se esperaba RIESGO_ALTO, llegó %+v (err=%v)", r1, err)
 	}
 
@@ -430,7 +391,7 @@ func estadoRegistrado(t *testing.T, s *fraudEngineServer, txID string) string {
 	t.Helper()
 	// El server de prueba y su Settlement comparten Redis y prefijo; el
 	// prefijo se recupera de una clave conocida del Verificador.
-	rdb := redisclient.Nuevo(redisAddrTest)
+	rdb := redisclient.Nuevo(pruebas.RedisAddr())
 	defer rdb.Close()
 	claves, err := rdb.Keys(context.Background(), "test:*:settle:"+txID).Result()
 	if err != nil {
@@ -491,9 +452,8 @@ func TestSettlementFalla(t *testing.T) {
 		// Tarda 100ms: el timeout propio (ReservaSettleNet = 15ms) corta
 		// mucho antes que el deadline del cliente.
 		{"Settlement lento", func(t *testing.T, s *fraudEngineServer) pb.SettlementClient {
-			rdb := redisclient.Nuevo(redisAddrTest)
-			t.Cleanup(func() { rdb.Close() })
-			return levantarSettlement(t, settlementLento{settlement.NuevoServidor(rdb, "test:lento:"), 100 * time.Millisecond})
+			rdb, prefijo := pruebas.Redis(t) // prefijo único, se limpia al terminar
+			return levantarSettlement(t, settlementLento{settlement.NuevoServidor(rdb, prefijo), 100 * time.Millisecond})
 		}, codes.DeadlineExceeded, presupuesto.ReservaSettleNet + 10*time.Millisecond},
 	}
 	for _, c := range casos {
@@ -517,7 +477,7 @@ func TestSettlementFalla(t *testing.T) {
 			}
 
 			resp, err := evaluar(t, s, txValida("t2", "tok-robada", baLat, baLon))
-			if err != nil || !resp.IsFraud || resp.RejectionReason != motivoBlacklist {
+			if err != nil || !resp.IsFraud || resp.RejectionReason != mandatoria.MotivoBlacklist {
 				t.Errorf("rechazo: resp=%+v err=%v, se esperaba el rechazo igual", resp, err)
 			}
 		})
@@ -608,9 +568,8 @@ func TestMotivosDeError(t *testing.T) {
 		{"categoría desconocida", nil, conCategoria(txValida("t1", "tok-ok", baLat, baLon), "no_existe"), 200 * time.Millisecond, codes.InvalidArgument, fallas.CategoriaDesconocida},
 		// Mismo código que el early drop, otro motivo: este es AMBIGUO.
 		{"settlement lento", func(t *testing.T, s *fraudEngineServer) {
-			rdb := redisclient.Nuevo(redisAddrTest)
-			t.Cleanup(func() { rdb.Close() })
-			s.settle = levantarSettlement(t, settlementLento{settlement.NuevoServidor(rdb, "test:lento:"), 100 * time.Millisecond})
+			rdb, prefijo := pruebas.Redis(t) // prefijo único, se limpia al terminar
+			s.settle = levantarSettlement(t, settlementLento{settlement.NuevoServidor(rdb, prefijo), 100 * time.Millisecond})
 		}, txValida("t1", "tok-ok", baLat, baLon), 90 * time.Millisecond, codes.DeadlineExceeded, fallas.SettlementTimeout},
 	}
 	for _, c := range casos {
@@ -694,5 +653,37 @@ func TestMetricasDePuntaAPunta(t *testing.T) {
 		if !strings.Contains(texto, want) {
 			t.Errorf("/metrics no contiene %q", want)
 		}
+	}
+}
+
+// validar es una función pura: se prueba sin Redis ni gRPC.
+func TestValidar(t *testing.T) {
+	base := func() *pb.TransactionRequest { return txValida("t1", "tok-ok", baLat, baLon) }
+	casos := []struct {
+		nombre string
+		cambio func(r *pb.TransactionRequest)
+		valida bool
+	}{
+		{"completa", func(r *pb.TransactionRequest) {}, true},
+		{"sin tx_id", func(r *pb.TransactionRequest) { r.TxId = "" }, false},
+		{"sin card_token", func(r *pb.TransactionRequest) { r.CardToken = "" }, false},
+		{"coordenadas (0, 0)", func(r *pb.TransactionRequest) { r.Latitude, r.Longitude = 0, 0 }, false},
+		{"latitud fuera de rango", func(r *pb.TransactionRequest) { r.Latitude = 95 }, false},
+		{"monto 0", func(r *pb.TransactionRequest) { r.Amount = 0 }, false},
+		{"monto NaN", func(r *pb.TransactionRequest) { r.Amount = math.NaN() }, false},
+		{"sin categoría", func(r *pb.TransactionRequest) { r.MerchantCategory = "" }, false},
+	}
+	for _, c := range casos {
+		t.Run(c.nombre, func(t *testing.T) {
+			r := base()
+			c.cambio(r)
+			err := validar(r)
+			if (err == nil) != c.valida {
+				t.Errorf("validar: err=%v, se esperaba válida=%v", err, c.valida)
+			}
+			if err != nil && (status.Code(err) != codes.InvalidArgument || fallas.Motivo(err) != fallas.RequestInvalida) {
+				t.Errorf("código=%v motivo=%q, se esperaba InvalidArgument / %s", status.Code(err), fallas.Motivo(err), fallas.RequestInvalida)
+			}
+		})
 	}
 }

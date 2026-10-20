@@ -1,15 +1,10 @@
-// Settlement: binario del segundo servicio del hot path. La lógica está en
-// internal/settlement; acá solo se conecta a Redis y a la red.
+// Settlement: binario del segundo servicio del camino de decisión. La
+// lógica está en internal/settlement; acá solo se conecta a Redis y a la red.
 package main
 
 import (
-	"context"
-	"log"
+	"log/slog"
 	"net"
-	"net/http"
-	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
@@ -17,74 +12,65 @@ import (
 	"fd_rts/internal/config"
 	"fd_rts/internal/metricas"
 	"fd_rts/internal/redisclient"
+	"fd_rts/internal/registro"
 	"fd_rts/internal/servicio"
 	"fd_rts/internal/settlement"
 	pb "fd_rts/proto"
 )
 
 func main() {
-	// Configuración por variables de entorno (Etapa 7.5). Los valores por
-	// defecto son los que se usaban fijos en el código hasta la Etapa 7.
+	if err := registro.Configurar("settlement"); err != nil {
+		registro.Fatal("configuración de logs inválida", "error", err)
+	}
+
+	// Configuración por variables de entorno (ADR-0017).
 	addr := config.Texto("GRPC_ADDR", ":50052")
 	metricasAddr := config.Texto("METRICAS_ADDR", ":2113") // "" = no exponer
 	redisAddr := config.Texto("REDIS_ADDR", "localhost:6379")
+	prefijo := config.Texto("REDIS_PREFIJO", redisclient.PrefijoPorDefecto)
 	espera, err := config.Duracion("APAGADO_ESPERA", 5*time.Second)
 	if err != nil {
-		log.Fatalf("configuración inválida: %v", err)
+		registro.Fatal("configuración inválida", "error", err)
 	}
 	aviso, err := config.Duracion("APAGADO_AVISO", 0) // ver cmd/server
 	if err != nil {
-		log.Fatalf("configuración inválida: %v", err)
+		registro.Fatal("configuración inválida", "error", err)
 	}
-	log.Printf("configuración: grpc=%s metricas=%q redis=%s apagado=%v aviso=%v", addr, metricasAddr, redisAddr, espera, aviso)
+	slog.Info("configuración", "grpc", addr, "metricas", metricasAddr, "redis", redisAddr,
+		"prefijo", prefijo, "apagado", espera, "aviso", aviso)
 
-	// Señal de apagado (SIGTERM del orquestador o Ctrl+C); un segundo
-	// Ctrl+C mata en el acto. Ver cmd/server.
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	ctx, stop := servicio.ContextoDeApagado()
 	defer stop()
-	go func() {
-		<-ctx.Done()
-		stop()
-	}()
 
-	rdb := redisclient.Nuevo(redisAddr)
-	defer rdb.Close() // después de servicio.Correr: las requests en vuelo lo necesitan
-
-	// Fail-closed desde el arranque, igual que el Fraud-Engine.
-	ctxPing, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	err = rdb.Ping(ctxPing).Err()
-	cancel()
+	rdb, err := redisclient.Conectar(ctx, redisAddr) // fail-closed desde el arranque
 	if err != nil {
-		log.Fatalf("no pude conectar a Redis en %s: %v", redisAddr, err)
+		registro.Fatal("no se pudo conectar a Redis", "error", err)
 	}
+	defer rdb.Close() // después de servicio.Correr: las requests en vuelo lo necesitan
 
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
-		log.Fatalf("no pude escuchar en %s: %v", addr, err)
+		registro.Fatal("no se pudo escuchar", "addr", addr, "error", err)
 	}
-	// Métricas (Etapa 7). Los estados y la latencia de extremo a extremo
+
+	// Métricas (ADR-0015). Los estados y la latencia de extremo a extremo
 	// salen de la respuesta: el handler no se toca.
 	reg := metricas.NuevoRegistro()
 	rpc := metricas.NuevoRPC(reg, "settlement")
 	dominio := metricas.NuevoSettlement(reg)
-	var srvMetricas *http.Server
-	if metricasAddr != "" {
-		srvMetricas = metricas.Servir(metricasAddr, reg)
-		log.Printf("métricas en %s/metrics", metricasAddr)
-	}
+	srvMetricas := metricas.Servir(metricasAddr, reg)
 
 	grpcServer := grpc.NewServer(grpc.UnaryInterceptor(rpc.Interceptor(func(resp any) {
 		if r, ok := resp.(*pb.SettlementResponse); ok {
 			dominio.Registrado(r.Status.String(), time.Duration(r.EndToEndLatencyMs)*time.Millisecond)
 		}
 	})))
-	pb.RegisterSettlementServer(grpcServer, settlement.NuevoServidor(rdb, "drts:"))
-
+	pb.RegisterSettlementServer(grpcServer, settlement.NuevoServidor(rdb, prefijo))
 	salud := servicio.NuevaSalud(grpcServer) // con Redis ya verificado
 
-	log.Printf("settlement escuchando en %s", addr)
+	slog.Info("settlement escuchando", "addr", addr)
 	if err := servicio.Correr(ctx, grpcServer, lis, salud, srvMetricas, servicio.Plazos{Aviso: aviso, Espera: espera}); err != nil {
-		log.Printf("settlement: %v", err)
+		slog.Warn("settlement", "error", err)
 	}
-	log.Printf("settlement apagado")
+	slog.Info("settlement apagado")
 }

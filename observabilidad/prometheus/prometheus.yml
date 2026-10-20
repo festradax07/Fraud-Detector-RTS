@@ -1,4 +1,4 @@
-# Prometheus del D-RTS (Etapas 7 y 7.5).
+# Prometheus del D-RTS (ADR-0015, ADR-0020).
 global:
   # 1s y no los 15s por defecto: una corrida del loadgen dura ~30s; con 15s
   # serían dos puntos y no se vería nada en vivo. Costo: más muestras

@@ -1,8 +1,9 @@
 // Package mandatoria implementa la fase mandatoria (M_i) del Fraud-Engine:
 // blacklist, control de velocidad y viaje imposible.
 //
-// Etapa 3: el estado vive en Redis. Los tres datos que necesita la fase se
-// traen en UN solo viaje de red (TxPipeline).
+// El estado vive en Redis y todo lo que necesita la fase se trae en UN solo
+// viaje de red (TxPipeline, ADR-0008). Las reglas en sí son funciones puras
+// (Evaluar, VelocidadKmh): se testean sin Redis.
 package mandatoria
 
 import (
@@ -15,6 +16,15 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+)
+
+// Motivos de rechazo de la fase mandatoria (campo rejection_reason). Son
+// códigos fijos, parte del contrato con los clientes (ADR-0005): el detalle
+// (cuántos intentos, cuántos km/h) va al log.
+const (
+	MotivoBlacklist      = "BLACKLIST"
+	MotivoCardTesting    = "CARD_TESTING"
+	MotivoViajeImposible = "VIAJE_IMPOSIBLE"
 )
 
 // Reglas del control de velocidad (card testing): más de MaxIntentos
@@ -139,14 +149,14 @@ func (v *Verificador) Consultar(ctx context.Context, txID, cardToken, categoria 
 	// Exec.
 	enBlacklist := pipe.SIsMember(ctx, v.claveBlacklist(), cardToken)
 	// ZREMRANGEBYSCORE es inclusivo: borra también el de exactamente 10s.
-	// Ventana = (ahora-10s, ahora], igual que en la Etapa 2.
+	// Ventana = (ahora-10s, ahora].
 	pipe.ZRemRangeByScore(ctx, claveVel, "-inf", strconv.FormatInt(limiteMs, 10))
 	// Miembro = tx_id (los miembros de un ZSET son únicos: con el timestamp
 	// como miembro, dos intentos en el mismo ms se fundirían en uno).
 	pipe.ZAdd(ctx, claveVel, redis.Z{Score: float64(ahoraMs), Member: txID})
 	intentos := pipe.ZCard(ctx, claveVel)
-	// Si la tarjeta no vuelve, Redis borra la clave sola: adiós a la fuga
-	// de memoria de la Etapa 2.
+	// Si la tarjeta no vuelve, Redis borra la clave sola: sin esto, las
+	// claves de tarjetas que no vuelven quedarían para siempre.
 	pipe.Expire(ctx, claveVel, VentanaVelocidad)
 	posGuardada := pipe.Get(ctx, v.clavePosicion(cardToken))
 	stats := pipe.HGetAll(ctx, v.claveStats(categoria))
@@ -182,6 +192,25 @@ func (v *Verificador) Consultar(ctx context.Context, txID, cardToken, categoria 
 	res.HayPrevia = true
 	res.Kmh = VelocidadKmh(previa, lat, lon, ahora)
 	return res, nil
+}
+
+// Evaluar aplica las reglas de la fase mandatoria al resultado de Consultar
+// y devuelve el motivo de rechazo, o "" si la transacción pasa.
+//
+// El orden es el de costo y certeza: una tarjeta en blacklist es fraude sin
+// más análisis; después la velocidad y el viaje imposible. Función pura: no
+// toca Redis ni el reloj.
+func Evaluar(r Resultado) string {
+	switch {
+	case r.EnBlacklist:
+		return MotivoBlacklist
+	case r.Intentos > MaxIntentos:
+		return MotivoCardTesting
+	case r.HayPrevia && r.Kmh > VelocidadMaxKmh:
+		return MotivoViajeImposible
+	default:
+		return ""
+	}
 }
 
 // ActualizarPosicion guarda (lat, lon, ahora) como la última posición
@@ -257,8 +286,7 @@ func DistanciaKm(lat1, lon1, lat2, lon2 float64) float64 {
 }
 
 // VelocidadKmh devuelve la velocidad (km/h) que implica ir desde previa
-// hasta (lat, lon) en el instante ahora. Función pura (en la Etapa 2 vivía
-// dentro de VelocidadDesdeUltima, mezclada con la lectura del map).
+// hasta (lat, lon) en el instante ahora. Función pura.
 func VelocidadKmh(previa Posicion, lat, lon float64, ahora time.Time) float64 {
 	distancia := DistanciaKm(previa.Lat, previa.Lon, lat, lon)
 
