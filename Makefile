@@ -1,4 +1,4 @@
-.PHONY: build run-server run-settlement cargar-stats carga-nominal carga-sobrecarga obs-up obs-down sistema-up sistema-down imagenes carga-compose limpiar-carga proto clean
+.PHONY: build run-server run-settlement cargar-stats carga-nominal carga-sobrecarga obs-up obs-down kafka-up kafka-down volcar sistema-up sistema-down imagenes carga-compose limpiar-carga proto clean
 
 build:
 	go build ./...
@@ -25,6 +25,20 @@ obs-up:
 obs-down:
 	docker compose down
 
+# Kafka solo (con sus topics), para el entorno nativo y los tests: queda en
+# localhost:9092. Los servicios nativos lo usan con KAFKA_BROKERS=localhost:9092.
+kafka-up:
+	docker compose --profile kafka up -d --wait kafka
+	docker compose --profile kafka up kafka-topics
+
+kafka-down:
+	docker compose --profile kafka down
+
+# Muestra en vivo los eventos que pasan por Kafka, como JSON (Ctrl+C corta).
+# Agregar ARGS=-desde-inicio para ver desde el principio.
+volcar:
+	go run ./cmd/eventos -rol volcar -metricas "" $(ARGS)
+
 # Sistema completo en Docker Compose (ADR-0020): Redis, carga de
 # estadísticas, Settlement y Fraud-Engine, más la observabilidad.
 sistema-up:
@@ -32,7 +46,7 @@ sistema-up:
 
 # Baja todo (sistema, carga y observabilidad).
 sistema-down:
-	docker compose --profile sistema --profile carga down
+	docker compose --profile sistema --profile carga --profile kafka down
 
 # Construye las imágenes sin levantar nada.
 imagenes:
@@ -64,7 +78,7 @@ proto:
 	protoc \
 		--go_out=. --go_opt=paths=source_relative \
 		--go-grpc_out=. --go-grpc_opt=paths=source_relative \
-		proto/transactions.proto
+		proto/transactions.proto proto/eventos.proto
 
 clean:
-	rm -f server settlement loadgen
+	rm -f server settlement loadgen eventos cargar-stats salud

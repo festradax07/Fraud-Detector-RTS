@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"net"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"google.golang.org/grpc"
 
 	"fd_rts/internal/config"
+	"fd_rts/internal/eventos"
 	"fd_rts/internal/metricas"
 	"fd_rts/internal/redisclient"
 	"fd_rts/internal/registro"
@@ -28,6 +30,7 @@ func main() {
 	metricasAddr := config.Texto("METRICAS_ADDR", ":2113") // "" = no exponer
 	redisAddr := config.Texto("REDIS_ADDR", "localhost:6379")
 	prefijo := config.Texto("REDIS_PREFIJO", redisclient.PrefijoPorDefecto)
+	kafkaBrokers := eventos.Brokers(config.Texto("KAFKA_BROKERS", "")) // vacío = sin eventos
 	espera, err := config.Duracion("APAGADO_ESPERA", 5*time.Second)
 	if err != nil {
 		registro.Fatal("configuración inválida", "error", err)
@@ -36,8 +39,14 @@ func main() {
 	if err != nil {
 		registro.Fatal("configuración inválida", "error", err)
 	}
+	// Cuánto vive cada registro en Redis: mientras un cliente pueda
+	// reintentar (idempotencia). 24h es un punto de partida de diseño.
+	ttl, err := config.Duracion("SETTLEMENT_TTL", 24*time.Hour)
+	if err != nil {
+		registro.Fatal("configuración inválida", "error", err)
+	}
 	slog.Info("configuración", "grpc", addr, "metricas", metricasAddr, "redis", redisAddr,
-		"prefijo", prefijo, "apagado", espera, "aviso", aviso)
+		"prefijo", prefijo, "kafka", kafkaBrokers, "ttl", ttl, "apagado", espera, "aviso", aviso)
 
 	ctx, stop := servicio.ContextoDeApagado()
 	defer stop()
@@ -60,17 +69,27 @@ func main() {
 	dominio := metricas.NuevoSettlement(reg)
 	srvMetricas := metricas.Servir(metricasAddr, reg)
 
+	// Eventos (ADR-0019): si Kafka no está, Settlement arranca igual.
+	productor, err := eventos.NuevoProductor(kafkaBrokers, eventos.TopicsPorDefecto, reg)
+	if err != nil {
+		registro.Fatal("productor de eventos", "error", err)
+	}
+
 	grpcServer := grpc.NewServer(grpc.UnaryInterceptor(rpc.Interceptor(func(resp any) {
 		if r, ok := resp.(*pb.SettlementResponse); ok {
 			dominio.Registrado(r.Status.String(), time.Duration(r.EndToEndLatencyMs)*time.Millisecond)
 		}
 	})))
-	pb.RegisterSettlementServer(grpcServer, settlement.NuevoServidor(rdb, prefijo))
+	pb.RegisterSettlementServer(grpcServer, settlement.NuevoServidor(rdb, prefijo, productor, ttl))
 	salud := servicio.NuevaSalud(grpcServer) // con Redis ya verificado
 
 	slog.Info("settlement escuchando", "addr", addr)
 	if err := servicio.Correr(ctx, grpcServer, lis, salud, srvMetricas, servicio.Plazos{Aviso: aviso, Espera: espera}); err != nil {
 		slog.Warn("settlement", "error", err)
 	}
+	// Las requests ya terminaron: entregar los eventos pendientes.
+	ctxFlush, cancel := context.WithTimeout(context.Background(), espera)
+	productor.Cerrar(ctxFlush)
+	cancel()
 	slog.Info("settlement apagado")
 }

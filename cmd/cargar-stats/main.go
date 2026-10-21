@@ -25,35 +25,18 @@ import (
 	"strconv"
 	"time"
 
+	"fd_rts/internal/estadisticas"
 	"fd_rts/internal/mandatoria"
 	"fd_rts/internal/opcional"
 	"fd_rts/internal/redisclient"
 	"fd_rts/internal/registro"
 )
 
-// acumulador lleva media y varianza de ln(monto) en una sola pasada, sin
-// guardar los valores (algoritmo de Welford). La fórmula ingenua
-// var = E[x²] - E[x]² resta dos números grandes y parecidos y pierde
-// precisión; Welford va corrigiendo la media de a un valor y no tiene ese
-// problema.
-type acumulador struct {
-	n       int
-	media   float64
-	m2      float64 // suma de cuadrados de las diferencias con la media
+// categoria acumula ln(monto) (Welford) y cuántos fraudes hubo.
+type categoria struct {
+	estadisticas.Acumulador
 	fraudes int
 }
-
-func (a *acumulador) agregar(x float64, esFraude bool) {
-	a.n++
-	delta := x - a.media
-	a.media += delta / float64(a.n)
-	a.m2 += delta * (x - a.media) // ojo: usa la media YA actualizada
-	if esFraude {
-		a.fraudes++
-	}
-}
-
-func (a *acumulador) desvio() float64 { return math.Sqrt(a.m2 / float64(a.n)) }
 
 func main() {
 	rutaCSV := flag.String("csv", "data/fraudTrain.csv", "CSV de entrenamiento (dataset Sparkov)")
@@ -73,7 +56,7 @@ func main() {
 	// Totales para la tasa de fraude global.
 	var total, fraudes int
 	for _, a := range porCategoria {
-		total += a.n
+		total += a.N
 		fraudes += a.fraudes
 	}
 	if fraudes == 0 {
@@ -101,25 +84,25 @@ func main() {
 	fmt.Printf("%-16s %8s %9s %10s %7s %8s\n", "categoria", "n", "media_log", "desvio_log", "peso", "%fraude")
 	for _, c := range categorias {
 		a := porCategoria[c]
-		tasa := float64(a.fraudes) / float64(a.n)
+		tasa := float64(a.fraudes) / float64(a.N)
 		peso := tasa / tasaGlobal
 
 		err := v.GuardarEstadisticas(ctx, c, map[string]any{
-			opcional.CampoMediaLog:  a.media,
-			opcional.CampoDesvioLog: a.desvio(),
+			opcional.CampoMediaLog:  a.Media,
+			opcional.CampoDesvioLog: a.Desvio(),
 			opcional.CampoPeso:      peso,
 		})
 		if err != nil {
 			registro.Fatal("no se pudo guardar en Redis", "categoria", c, "error", err)
 		}
-		fmt.Printf("%-16s %8d %9.4f %10.4f %7.3f %7.3f%%\n", c, a.n, a.media, a.desvio(), peso, 100*tasa)
+		fmt.Printf("%-16s %8d %9.4f %10.4f %7.3f %7.3f%%\n", c, a.N, a.Media, a.Desvio(), peso, 100*tasa)
 	}
 	fmt.Printf("cargadas %d categorías en Redis (%s, prefijo %q)\n", len(categorias), *redisAddr, *prefijo)
 }
 
 // leerCSV recorre el CSV fila por fila (sin cargarlo entero en memoria) y
 // acumula las estadísticas por categoría.
-func leerCSV(ruta string) (map[string]*acumulador, error) {
+func leerCSV(ruta string) (map[string]*categoria, error) {
 	f, err := os.Open(ruta)
 	if err != nil {
 		return nil, err
@@ -146,7 +129,7 @@ func leerCSV(ruta string) (map[string]*acumulador, error) {
 		}
 	}
 
-	porCategoria := map[string]*acumulador{}
+	porCategoria := map[string]*categoria{}
 	for fila := 2; ; fila++ { // fila 1 es el encabezado
 		reg, err := r.Read()
 		if errors.Is(err, io.EOF) {
@@ -164,10 +147,13 @@ func leerCSV(ruta string) (map[string]*acumulador, error) {
 		c := reg[col["category"]]
 		a, ok := porCategoria[c]
 		if !ok {
-			a = &acumulador{}
+			a = &categoria{}
 			porCategoria[c] = a
 		}
-		a.agregar(math.Log(monto), reg[col["is_fraud"]] == "1")
+		a.Agregar(math.Log(monto))
+		if reg[col["is_fraud"]] == "1" {
+			a.fraudes++
+		}
 	}
 	return porCategoria, nil
 }

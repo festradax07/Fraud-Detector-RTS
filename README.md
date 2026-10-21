@@ -83,51 +83,86 @@ admisión y el slack no puedan contradecirse.
 
 ## Arquitectura
 
+El sistema se lee en tres capas, en el orden en que las recorre una
+transacción. Las flechas llenas son sincrónicas (cuentan contra el deadline);
+las punteadas son asíncronas (no lo tocan).
+
 ```mermaid
 flowchart TB
-    subgraph carga["Generador de carga"]
-        LG["loadgen<br/>lazo abierto, Poisson"]
+    subgraph hot["① Camino de decisión · sincrónico · ≤ 200ms de extremo a extremo"]
+        direction LR
+        C(["Cliente<br/>(loadgen)"])
+        FE["<b>Fraud-Engine</b><br/>admisión → mandatoria<br/>→ slack → opcional"]
+        ST["<b>Settlement</b><br/>registro idempotente"]
+        C <== "gRPC · deadline 200ms<br/>request ⇄ decisión" ==> FE
+        FE == "gRPC · timeout 15ms<br/>liquidar" ==> ST
     end
 
-    subgraph hot["Camino de decisión (sincrónico, ≤ 200ms)"]
-        FE["Fraud-Engine<br/>admisión · mandatoria · slack · opcional"]
-        ST["Settlement<br/>registro idempotente"]
-        RD[("Redis<br/>estado de detección<br/>estadísticas · registros")]
+    subgraph datos["② Datos"]
+        direction LR
+        RD[("<b>Redis</b><br/>estado de detección<br/>estadísticas · registros")]
+        KF[["<b>Kafka</b><br/>transacciones.evaluadas<br/>transacciones.liquidadas"]]
     end
 
-    subgraph obs["Observabilidad"]
-        PR["Prometheus<br/>scrape cada 1s"]
-        GF["Grafana<br/>dashboard provisionado"]
+    subgraph cold["③ Cold path · asíncrono · sin deadline"]
+        direction LR
+        AU["Auditoría<br/>cruce por tx_id"]
+        ES["Estadísticas<br/>modo sombra"]
+        AL["Alertas<br/>de fraude"]
     end
 
-    subgraph cold["Columna de eventos (planificada)"]
-        KF[["Kafka"]]
-        CS["auditoría · estadísticas en vivo · alertas"]
-    end
-
-    LG -- "gRPC, deadline 200ms" --> FE
-    FE -- "TxPipeline: 1 viaje" --> RD
-    FE -- "gRPC, timeout 15ms" --> ST
+    FE -- "1 viaje (TxPipeline)" --> RD
     ST -- "script Lua atómico" --> RD
-    PR -. "/metrics" .-> FE
-    PR -. "/metrics" .-> ST
-    PR -. "/metrics" .-> LG
-    GF --> PR
-    FE -. "eventos (no bloquea)" .-> KF
-    ST -. "eventos (no bloquea)" .-> KF
-    KF -.-> CS
+    FE -. "evento · no bloquea" .-> KF
+    ST -. "evento · no bloquea" .-> KF
+    KF -.-> AU
+    KF -.-> ES
+    KF -.-> AL
+
+    classDef sinc fill:#e8f4fd,stroke:#1f6fb2,stroke-width:2px,color:#0b2e4f
+    classDef cliente fill:#ffffff,stroke:#1f6fb2,stroke-width:2px,color:#0b2e4f
+    classDef dato fill:#fff4e5,stroke:#b26b00,stroke-width:2px,color:#4a2c00
+    classDef asinc fill:#f5f5f5,stroke:#888,stroke-dasharray: 4 3,color:#333
+    class FE,ST sinc
+    class C cliente
+    class RD,KF dato
+    class AU,ES,AL asinc
 ```
 
-- **Camino de decisión (hot path):** sincrónico, con el deadline propagado de
-  punta a punta en el `context.Context` y en el header `grpc-timeout`. Es lo
-  que da el **flujo completo acotado**: dentro de los 200ms el cliente sabe el
-  resultado final, o sabe que no lo sabe
-  ([ADR-0002](docs/adr/0002-camino-de-decision-sincronico-con-grpc.md)).
-- **Columna de eventos (planificada):** Kafka **al costado** del camino de
-  decisión, nunca en él
-  ([ADR-0019](docs/adr/0019-kafka-como-columna-de-eventos.md)).
-- **Fail-closed:** si no se puede verificar, no se aprueba
-  ([ADR-0009](docs/adr/0009-fail-closed-y-fallo-rapido.md)).
+1. **Camino de decisión (sincrónico, ≤ 200ms).** El cliente llama al
+   Fraud-Engine con un deadline; el motor decide y liquida con Settlement
+   antes de responder. El deadline viaja de punta a punta en el
+   `context.Context` y en el header `grpc-timeout`: es lo que da el **flujo
+   completo acotado**, porque dentro de los 200ms el cliente sabe el
+   resultado final, o sabe que no lo sabe
+   ([ADR-0002](docs/adr/0002-camino-de-decision-sincronico-con-grpc.md)).
+2. **Datos.** Redis guarda el estado que el camino de decisión consulta y
+   escribe (en un solo viaje por transacción,
+   [ADR-0008](docs/adr/0008-redis-un-viaje-atomico.md)). Kafka recibe los
+   eventos de lo que pasó, en protobuf
+   ([ADR-0024](docs/adr/0024-eventos-en-protobuf-sin-bloquear.md)).
+3. **Cold path (asíncrono, sin deadline).** Consumidores que procesan los
+   eventos a su ritmo: auditoría (cruza lo que respondió el motor con lo que
+   registró Settlement), estadísticas en vivo en modo sombra y alertas de
+   fraude. Publicar **nunca bloquea**: con Kafka caído, el camino de decisión
+   da igual ([ADR-0019](docs/adr/0019-kafka-como-columna-de-eventos.md)). La
+   auditoría escribe un archivo JSONL por día y hace visibles las
+   discrepancias, como la *ambigua comprometida*: el cliente recibió error,
+   pero la transacción se comprometió
+   ([ADR-0025](docs/adr/0025-consumidores-y-auditoria.md)).
+
+Dos reglas atraviesan todo: **fail-closed** (si no se puede verificar, no se
+aprueba, [ADR-0009](docs/adr/0009-fail-closed-y-fallo-rapido.md)) y
+**idempotencia por `tx_id`** (reintentar una transacción no cambia su
+resultado, [ADR-0013](docs/adr/0013-ambiguedad-del-timeout-e-idempotencia.md)).
+
+En Docker Compose cada capa vive en su propia red privada (`aplicacion`,
+`datos`, `observabilidad`), y los servicios se conectan solo a las que
+necesitan, como security groups en una VPC
+([ADR-0023](docs/adr/0023-redes-como-subredes-privadas.md)).
+
+La observabilidad (métricas, dashboard) es transversal y se describe en su
+[propia sección](#observabilidad).
 
 ## Recorrido de una transacción
 
@@ -202,6 +237,7 @@ timeout esperando a Settlement es "resultado desconocido" y cómo se resuelve:
 | [`loadgen`](cmd/loadgen/main.go) | **Generador de carga** de lazo abierto (llegadas de Poisson). Mide la latencia desde el instante programado, clasifica resultados y reintenta los ambiguos. Métricas `:2114`. | 0014 |
 | [`cargar-stats`](cmd/cargar-stats/main.go) | Calcula media, desvío y peso de riesgo por categoría (algoritmo de Welford) desde el dataset y los guarda en Redis. | 0010 |
 | [`salud`](cmd/salud/main.go) | Chequeo de salud por gRPC para contenedores sin shell. | 0020 |
+| [`eventos`](cmd/eventos/main.go) | **Consumidores del cold path**, un rol por contenedor: `auditoria` (cruza los dos topics y detecta discrepancias), `alertas`, `estadisticas` (modo sombra) y `volcar` (muestra los eventos como JSON). | 0025 |
 
 ### Paquetes (`internal/`)
 
@@ -210,7 +246,11 @@ timeout esperando a Settlement es "resultado desconocido" y cómo se resuelve:
 | [`presupuesto`](internal/presupuesto/presupuesto.go) | El modelo temporal: deadline global, WCETs, reserva, `Admitir`, `Slack`, `CorreOpcional`. Funciones puras. |
 | [`mandatoria`](internal/mandatoria/mandatoria.go) | Fase mandatoria contra Redis en un solo viaje (`TxPipeline`): blacklist, ventana de velocidad (ZSET), posición confiable, Haversine. |
 | [`opcional`](internal/opcional/opcional.go) | Scoring: Z-score sobre ln(monto) ponderado por categoría, con costo de CPU simulado configurable. |
-| [`settlement`](internal/settlement/settlement.go) | El servicio Settlement: registro con script Lua ("el primer resultado final gana") y trailer con su tiempo interno. |
+| [`settlement`](internal/settlement/settlement.go) | El servicio Settlement: registro con script Lua ("el primer resultado final gana"), con TTL, y trailer con su tiempo interno. |
+| [`eventos`](internal/eventos/eventos.go) | Productor de eventos que nunca bloquea (`TryProduce`, buffer acotado, descartes contados). |
+| [`consumo`](internal/consumo/consumo.go) | Bucle de consumo "al menos una vez" (confirma después de procesar) con métrica de lag. |
+| [`auditoria`](internal/auditoria/auditoria.go) | Cruce de los dos topics por `tx_id` con ventana, clasificación pura y archivo JSONL por día. |
+| [`estadisticas`](internal/estadisticas/estadisticas.go) | Media y desvío en una pasada (Welford), compartido por la línea base y las estadísticas en vivo. |
 | [`fallas`](internal/fallas/fallas.go) | Motivos de error (`google.rpc.ErrorInfo`): el contrato de errores con los clientes. |
 | [`metricas`](internal/metricas/metricas.go) | Interceptor gRPC (tasa, errores, latencia, en vuelo, respuestas tardías) y métricas del modelo temporal. |
 | [`redisclient`](internal/redisclient/redisclient.go) | Cliente de Redis con la configuración del hot path: respeta el deadline del `ctx` y no reintenta. |
@@ -222,9 +262,11 @@ timeout esperando a Settlement es "resultado desconocido" y cómo se resuelve:
 ### Contrato
 
 [`proto/transactions.proto`](proto/transactions.proto) define dos servicios:
-`FraudEngine.EvaluateTransaction` y `Settlement.CommitTransaction`. El código
-generado está versionado; se regenera con `make proto` solo si cambia el
-contrato.
+`FraudEngine.EvaluateTransaction` y `Settlement.CommitTransaction`.
+[`proto/eventos.proto`](proto/eventos.proto) define los eventos de Kafka
+(`TransaccionEvaluada`, `TransaccionLiquidada`), que reusan los mensajes del
+contrato. El código generado está versionado; se regenera con `make proto`
+solo si cambia un `.proto`.
 
 ## Estructura del repositorio y por qué
 
@@ -236,14 +278,16 @@ contrato.
 │   ├── settlement/        Settlement
 │   ├── loadgen/           generador de carga
 │   ├── cargar-stats/      estadísticas del scoring → Redis
-│   └── salud/             chequeo de salud para contenedores
+│   ├── salud/             chequeo de salud para contenedores
+│   └── eventos/           consumidores del cold path (un rol por contenedor)
 ├── internal/              toda la lógica (no importable desde afuera del módulo)
 ├── observabilidad/        Prometheus y Grafana, provisionados desde archivos
 ├── docs/adr/              decisiones de diseño
 ├── Dockerfile             una imagen por servicio (--target)
 ├── docker-compose.yml     el sistema completo, por perfiles
 ├── Makefile               atajos
-└── data/                  dataset (fuera de git; se descarga aparte)
+├── data/                  dataset (fuera de git; se descarga aparte)
+└── auditoria/             registro de auditoría, un JSONL por día (fuera de git)
 ```
 
 - **`cmd/` solo cablea, `internal/` hace.** Cada binario lee su configuración,
@@ -278,13 +322,16 @@ contrato.
 | **Modelo de tiempo real** | [0002](docs/adr/0002-camino-de-decision-sincronico-con-grpc.md) camino sincrónico con deadline propagado · [0003](docs/adr/0003-control-de-admision-temprano.md) admisión temprana · [0004](docs/adr/0004-computacion-imprecisa.md) computación imprecisa · [0011](docs/adr/0011-costo-simulado-y-wcet.md) peor caso, no promedio |
 | **Correctitud ante fallas** | [0005](docs/adr/0005-fraude-no-es-error.md) un fraude no es un error · [0009](docs/adr/0009-fail-closed-y-fallo-rapido.md) fail-closed y fallo rápido · [0012](docs/adr/0012-settlement-segundo-servicio-sincronico.md) Settlement con timeout propio · [0013](docs/adr/0013-ambiguedad-del-timeout-e-idempotencia.md) ambigüedad del timeout e idempotencia · [0022](docs/adr/0022-conexion-caida-es-resultado-ambiguo.md) conexión caída = ambiguo |
 | **Detección** | [0006](docs/adr/0006-que-se-registra-ante-un-rechazo.md) qué se registra ante un rechazo · [0007](docs/adr/0007-validacion-estricta-de-la-request.md) validación · [0008](docs/adr/0008-redis-un-viaje-atomico.md) Redis en un viaje atómico · [0010](docs/adr/0010-modelo-de-scoring.md) scoring |
-| **Medir y operar** | [0014](docs/adr/0014-load-generator-de-lazo-abierto.md) generador de lazo abierto · [0015](docs/adr/0015-observabilidad-prometheus-grafana.md) observabilidad · [0016](docs/adr/0016-tests-contra-infraestructura-real.md) tests reales · [0017](docs/adr/0017-configuracion-por-entorno-y-apagado-ordenado.md) configuración y apagado · [0018](docs/adr/0018-evaluar-en-distintos-entornos.md) evaluar por entornos · [0019](docs/adr/0019-kafka-como-columna-de-eventos.md) Kafka como columna de eventos · [0020](docs/adr/0020-imagenes-salud-y-compose.md) imágenes, salud y Compose · [0021](docs/adr/0021-logs-con-niveles.md) logs con niveles |
+| **Cold path (Kafka)** | [0019](docs/adr/0019-kafka-como-columna-de-eventos.md) Kafka al costado · [0023](docs/adr/0023-redes-como-subredes-privadas.md) redes como subredes privadas · [0024](docs/adr/0024-eventos-en-protobuf-sin-bloquear.md) eventos en protobuf sin bloquear · [0025](docs/adr/0025-consumidores-y-auditoria.md) consumidores y auditoría |
+| **Medir y operar** | [0014](docs/adr/0014-load-generator-de-lazo-abierto.md) generador de lazo abierto · [0015](docs/adr/0015-observabilidad-prometheus-grafana.md) observabilidad · [0016](docs/adr/0016-tests-contra-infraestructura-real.md) tests reales · [0017](docs/adr/0017-configuracion-por-entorno-y-apagado-ordenado.md) configuración y apagado · [0018](docs/adr/0018-evaluar-en-distintos-entornos.md) evaluar por entornos · [0020](docs/adr/0020-imagenes-salud-y-compose.md) imágenes, salud y Compose · [0021](docs/adr/0021-logs-con-niveles.md) logs con niveles |
 
 ## Lo que mostraron las mediciones
 
 Medido en la notebook de desarrollo (Intel i7-12650H, 16 hilos), todo en la
-misma máquina. Son datos de **ese** entorno; la comparación formal entre
-entornos está en curso.
+misma máquina y con el cargador conectado. Son datos de **ese** entorno; la
+comparación formal entre entornos está en curso. Ojo: a batería, el CPU baja
+a menos de la mitad de su frecuencia y la latencia se duplica, así que el
+estado de energía es parte de cada medición.
 
 | Qué | Resultado |
 |---|---|
@@ -296,6 +343,8 @@ entornos está en curso.
 | Carga de 700 / 1400 RPS | 56% / 11% dentro del deadline: **colapso por congestión** (el goodput cae de ~205/s a ~62/s) |
 | Sistema completo en Docker Compose, 300 RPS | 100% dentro del deadline, P50 19ms, P99 31ms |
 | Apagado con SIGTERM a mitad de carga | **0** transacciones en vuelo perdidas (con SIGKILL se cortan todas a la vez) |
+| Kafka arriba / caído / deshabilitado, 300 RPS | el camino de decisión da **igual** en los tres (100%, P50 ~19ms); con Kafka caído los eventos esperan en el buffer |
+| Auditoría en Compose, 300 RPS | detectó **99 ambiguas comprometidas** que antes eran invisibles |
 
 El colapso por congestión es el hallazgo más importante hasta ahora: sin una
 cola delante del handler, toda request pasa la admisión con ~200ms y después
@@ -319,14 +368,16 @@ espera que consuma $D_{rem}$
 ### Opción A: todo en Docker Compose
 
 ```sh
-make sistema-up                                   # Redis, estadísticas, Settlement, Fraud-Engine + Prometheus y Grafana
+make sistema-up                                   # Redis, Kafka, Settlement, Fraud-Engine, consumidores + Prometheus y Grafana
 make carga-compose ARGS="-rps 300 -duracion 30s"  # carga dentro del Compose
 make sistema-down                                 # bajar todo
 ```
 
 El orden de arranque lo dan los chequeos de salud: Redis → carga de
 estadísticas (un contenedor que corre una vez y termina) → Settlement →
-Fraud-Engine.
+Fraud-Engine. Kafka y sus topics arrancan en paralelo: el motor no depende de
+ellos. La auditoría queda en `auditoria/AAAA-MM-DD.jsonl`; para ver los
+eventos en vivo, `make volcar`.
 
 ### Opción B: binarios nativos
 
@@ -337,6 +388,7 @@ make run-settlement                                  # en una terminal
 make run-server                                      # en otra
 make carga-nominal                                   # 50 RPS, 30s
 go run ./cmd/loadgen -rps 700 -duracion 30s          # o cualquier tasa
+make kafka-up                                        # Kafka (opcional; los servicios usan KAFKA_BROKERS=localhost:9092)
 make obs-up                                          # Prometheus + Grafana (opcional)
 ```
 
@@ -361,10 +413,30 @@ escrito impide arrancar.
 | `APAGADO_AVISO` | `0s` | `0s` | tiempo en `NOT_SERVING` antes de dejar de atender (detrás de un balanceador) |
 | `LOG_NIVEL` | `info` | `info` | `debug` agrega una línea por transacción ([ADR-0021](docs/adr/0021-logs-con-niveles.md)) |
 | `LOG_FORMATO` | `texto` | `texto` | `json` para la nube |
+| `KAFKA_BROKERS` | `""` | `""` | brokers de Kafka; vacío = eventos deshabilitados (el sistema funciona igual) |
+| `SETTLEMENT_TTL` | — | `24h` | cuánto vive cada registro de Settlement en Redis (mientras se pueda reintentar) |
 
 El generador de carga se configura por flags: `go run ./cmd/loadgen -h`.
 
 ## Observabilidad
+
+```mermaid
+flowchart LR
+    subgraph sistema["Sistema"]
+        direction TB
+        FE["Fraud-Engine :2112"]
+        ST["Settlement :2113"]
+        LG["loadgen :2114"]
+        EV["consumidores :2115<br/>auditoría · alertas · estadísticas"]
+    end
+    PR["<b>Prometheus</b><br/>scrape cada 1s"]
+    GF["<b>Grafana</b><br/>dashboard provisionado"]
+    FE -. "/metrics" .-> PR
+    ST -. "/metrics" .-> PR
+    LG -. "/metrics" .-> PR
+    EV -. "/metrics" .-> PR
+    PR --> GF
+```
 
 `make obs-up` (o `make sistema-up`) levanta Prometheus (http://localhost:9090)
 y Grafana (http://localhost:3000, sin login, solo en `localhost`). El
@@ -377,6 +449,11 @@ dashboard **"D-RTS — Tiempo real"** se lee de arriba hacia abajo:
    llegar, slack, decisiones, duración de cada fase.
 3. **Settlement:** estados registrados y latencia de extremo a extremo.
 4. **Runtime de Go y CPU:** núcleos por proceso, pausas del GC, goroutines.
+5. **Cold path (Kafka):** eventos publicados y descartados, buffer del
+   productor, lag de cada consumidor, resultado de la auditoría (con las
+   discrepancias contadas aparte), alertas por motivo y deriva de las
+   estadísticas en sombra. Con Kafka caído, las filas 1–4 no cambian: es la
+   forma de verlo.
 
 Prometheus scrapea las dos formas de correr el sistema con la etiqueta
 `entorno` (`nativo` / `compose`), con el mismo dashboard. El interceptor de
@@ -386,11 +463,12 @@ métricas cuesta ~120ns por request.
 
 ```sh
 docker start redis-drts    # los tests usan Redis real
+make kafka-up              # y Kafka real
 go test -race ./...
 ```
 
-Los tests usan **Redis real** y **servidores gRPC reales** en puertos reales.
-Si Redis no está levantado, fallan con un mensaje que dice cómo levantarlo
+Los tests usan **Redis real**, **Kafka real** y **servidores gRPC reales** en
+puertos reales. Si falta alguno, fallan con un mensaje que dice cómo levantarlo
 (no se saltean: un test salteado se ve "ok"). `REDIS_ADDR` permite apuntar a
 otro Redis. Algunos tests reproducen fallas con infraestructura real
 modificada: un Settlement que tarda, uno que compromete y "pierde" la
@@ -402,7 +480,9 @@ respuesta, un puerto donde no escucha nadie.
 |---|---|
 | Admisión, fase mandatoria, Redis, slack y fase opcional, Settlement, generador de carga, observabilidad | ✅ |
 | Contenedores: configuración por entorno, apagado ordenado, salud, Compose | ✅ |
-| Kafka como columna de eventos (auditoría, estadísticas en vivo, alertas) + experimento de modo asíncrono | planificado ([ADR-0019](docs/adr/0019-kafka-como-columna-de-eventos.md)) |
+| Kafka como columna de eventos: Kafka, redes privadas, eventos en protobuf publicados sin bloquear | ✅ ([ADR-0023](docs/adr/0023-redes-como-subredes-privadas.md), [ADR-0024](docs/adr/0024-eventos-en-protobuf-sin-bloquear.md)) |
+| Consumidores: auditoría con detección de discrepancias, estadísticas en vivo (sombra), alertas; TTL en Settlement | ✅ ([ADR-0025](docs/adr/0025-consumidores-y-auditoria.md)) |
+| Experimento: Kafka en el camino de decisión (modo asíncrono) | planificado |
 | Nube (AWS) | planificado |
 | Calibración por entorno: pool de workers contra el colapso por congestión, pausas del GC, comparación nativo / Compose / nube | planificado |
 

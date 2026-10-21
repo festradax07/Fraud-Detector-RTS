@@ -23,6 +23,11 @@ scrape_configs:
         labels: { entorno: nativo }
       - targets: ["settlement:2113"]
         labels: { entorno: compose }
+  # Consumidores del cold path: solo en Compose (un contenedor por rol).
+  - job_name: eventos
+    static_configs:
+      - targets: ["eventos-auditoria:2115", "eventos-alertas:2115", "eventos-estadisticas:2115"]
+        labels: { entorno: compose }
   - job_name: loadgen
     static_configs:
       - targets: ["host.docker.internal:2114"]

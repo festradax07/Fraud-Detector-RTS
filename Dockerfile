@@ -30,7 +30,7 @@ ENV CGO_ENABLED=0
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     go build -trimpath -ldflags="-s -w" -o /out/ \
-      ./cmd/server ./cmd/settlement ./cmd/loadgen ./cmd/cargar-stats ./cmd/salud
+      ./cmd/server ./cmd/settlement ./cmd/loadgen ./cmd/cargar-stats ./cmd/salud ./cmd/eventos
 
 # distroless/static: ~6MB, sin shell, sin gestor de paquetes, usuario no-root
 # (uid 65532). Trae certificados CA y zona horaria; nada más. Menos
@@ -54,6 +54,12 @@ FROM base AS loadgen
 COPY --from=compilar /out/loadgen /loadgen
 EXPOSE 2114
 ENTRYPOINT ["/loadgen"]
+
+# Consumidores del cold path (un binario, el rol se elige con -rol).
+FROM base AS eventos
+COPY --from=compilar /out/eventos /eventos
+EXPOSE 2115
+ENTRYPOINT ["/eventos"]
 
 FROM base AS cargar-stats
 COPY --from=compilar /out/cargar-stats /cargar-stats
