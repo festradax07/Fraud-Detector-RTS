@@ -1,6 +1,6 @@
 # ADR-0012: Settlement como segundo servicio sincrónico, con timeout propio
 
-- **Estado:** Aceptada
+- **Estado:** Aceptada (la "política ante fallas" la reemplaza [ADR-0027](0027-reintento-responde-lo-registrado.md))
 - **Fecha:** 2026-10-04
 - **Etapa:** 5
 

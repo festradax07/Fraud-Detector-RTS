@@ -133,6 +133,13 @@ func (s *fraudEngineServer) EvaluateTransaction(ctx context.Context, req *pb.Tra
 	if err != nil {
 		return nil, err
 	}
+	// ¿Es un reintento de algo que ya tiene resultado final? Entonces se
+	// responde eso, sin volver a evaluar (ADR-0027): con la Computación
+	// Imprecisa dos intentos pueden decidir distinto (uno degradado, otro
+	// con scoring), y lo que vale es lo registrado.
+	if reg, ok := settlement.LeerRegistro(res.Registro); ok {
+		return s.respuestaRegistrada(ctx, req, reg, inicio, tr)
+	}
 	if motivo := mandatoria.Evaluar(res); motivo != "" {
 		if registro.Depurando(ctx) {
 			slog.DebugContext(ctx, "fraude", "tx_id", req.TxId, "motivo", motivo,
@@ -285,10 +292,13 @@ func rechazo(req *pb.TransactionRequest, motivo string, score float64) *pb.Evalu
 // deadline: si al ctx de la request le queda menos, gana el que vence
 // primero.
 //
-// Política ante una falla de Settlement:
-//   - Aprobada: fail-closed. Sin commit confirmado no se responde "aprobada".
-//   - Rechazada: la decisión de rechazar ya es la segura. Se responde igual
-//     y queda en el log que se perdió el registro.
+// Ante una falla de Settlement, la respuesta es AMBIGUA, sea aprobada o
+// rechazada (ADR-0027): sin saber qué quedó registrado no se responde una
+// decisión. Hasta ADR-0027 un rechazo se respondía igual ("rechazar es lo
+// seguro"), pero en un reintento puede haber un commit de un intento
+// anterior todavía en vuelo: el cliente recibía "rechazada" con la plata
+// comprometida. El cliente reintenta con el mismo tx_id y converge a lo
+// registrado.
 //
 // Toda salida de liquidar publica el evento TransaccionEvaluada (el defer):
 // las decisiones y también las fallas de Settlement, que la auditoría
@@ -314,13 +324,55 @@ func (s *fraudEngineServer) liquidar(ctx context.Context, req *pb.TransactionReq
 	eval.ProcessingTimeMs = time.Since(inicio).Milliseconds()
 
 	if err != nil {
-		if eval.IsFraud {
-			slog.WarnContext(ctx, "registro perdido: el rechazo se responde igual", "tx_id", req.TxId, "error", err)
-			return eval, nil
-		}
 		return nil, fallaDeSettlement(ctx, req.TxId, err)
 	}
 	return respuestaSegunRegistro(ctx, req.TxId, eval, sr)
+}
+
+// respuestaRegistrada responde un reintento con lo que Settlement ya
+// registró (ADR-0027), sin volver a evaluar: el reintento no paga la fase
+// opcional (bajo sobrecarga, los reintentos son una parte grande de la
+// carga) y no puede decidir distinto que el intento que se registró.
+//
+// Igual le reenvía a Settlement la evaluación registrada, pero la respuesta
+// NO depende de esa llamada: el resultado ya es final y no cambia
+// (registrarUnaVez). La llamada existe para el cold path: si el intento
+// anterior quedó registrado pero su respuesta de Redis no llegó ("sin
+// registrar: i/o timeout"), Settlement nunca publicó el evento, y sin esta
+// llamada la auditoría vería un EVENTO_PERDIDO. Settlement es el único que
+// publica lo registrado; los consumidores toleran el duplicado.
+//
+// Publica la evaluada como cualquier respuesta: la auditoría cruza la última
+// evaluada de cada tx_id contra lo registrado.
+func (s *fraudEngineServer) respuestaRegistrada(ctx context.Context, req *pb.TransactionRequest, reg settlement.Registro, inicio time.Time, tr traza) (resp *pb.EvaluationResponse, err error) {
+	defer func() { s.publicarEvaluada(req, resp, err, tr) }()
+	s.metricas.RespuestaRegistrada(reg.Estado.String())
+
+	eval := &pb.EvaluationResponse{
+		TxId:            req.TxId,
+		IsFraud:         reg.Estado == pb.TxStatus_STATUS_REJECTED_FRAUD,
+		RejectionReason: reg.Motivo,
+		RiskScore:       reg.Score,
+		IsDegraded:      reg.Degradada,
+	}
+	ctxSettle, cancel := context.WithTimeout(ctx, presupuesto.ReservaSettleNet)
+	defer cancel()
+	var trailer metadata.MD
+	t := time.Now()
+	_, errSettle := s.settle.CommitTransaction(ctxSettle, &pb.SettlementRequest{
+		TxId:                req.TxId,
+		UserId:              req.UserId,
+		Amount:              req.Amount,
+		Evaluation:          eval,
+		EmissionTimestampNs: req.EmissionTimestampNs,
+	}, grpc.Trailer(&trailer))
+	s.medirSettlement(time.Since(t), trailer)
+	if registro.Depurando(ctx) {
+		slog.DebugContext(ctx, "reintento: se responde lo registrado", "tx_id", req.TxId, "estado", reg.Estado, "reconfirmado", errSettle == nil)
+	}
+
+	eval.ProcessingTimeMs = time.Since(inicio).Milliseconds()
+	return eval, nil
 }
 
 // publicarEvaluada publica el evento de lo que el motor respondió. No

@@ -264,3 +264,29 @@ func TestRegistroConTTL(t *testing.T) {
 		t.Errorf("TTL = %v (err=%v), se esperaba ~24h", ttl, err)
 	}
 }
+
+// LeerRegistro solo devuelve resultados FINALES: la misma regla que
+// registrarUnaVez. ABORTED_TIMEOUT no es final (un reintento a tiempo lo
+// reemplaza), así que no sirve para responder un reintento (ADR-0027).
+func TestLeerRegistro(t *testing.T) {
+	casos := []struct {
+		nombre string
+		campos map[string]string
+		ok     bool
+		want   Registro
+	}{
+		{"no existe (HGETALL vacío)", map[string]string{}, false, Registro{}},
+		{"abortada: no es final", map[string]string{"estado": "STATUS_ABORTED_TIMEOUT"}, false, Registro{}},
+		{"estado desconocido", map[string]string{"estado": "OTRA_COSA"}, false, Registro{}},
+		{"comprometida y degradada", map[string]string{"estado": "STATUS_COMMITTED", "risk_score": "0", "is_degraded": "1"},
+			true, Registro{Estado: pb.TxStatus_STATUS_COMMITTED, Degradada: true}},
+		{"rechazada", map[string]string{"estado": "STATUS_REJECTED_FRAUD", "rejection_reason": "RIESGO_ALTO", "risk_score": "0.9", "is_degraded": "0"},
+			true, Registro{Estado: pb.TxStatus_STATUS_REJECTED_FRAUD, Motivo: "RIESGO_ALTO", Score: 0.9}},
+	}
+	for _, c := range casos {
+		got, ok := LeerRegistro(c.campos)
+		if ok != c.ok || got != c.want {
+			t.Errorf("%s: LeerRegistro = %+v, %v; se esperaba %+v, %v", c.nombre, got, ok, c.want, c.ok)
+		}
+	}
+}

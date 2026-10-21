@@ -157,6 +157,7 @@ type Motor struct {
 	dremLlegada prometheus.Histogram
 	slack       prometheus.Histogram
 	fase        *prometheus.HistogramVec
+	registradas *prometheus.CounterVec
 }
 
 // Fases medidas por separado.
@@ -191,8 +192,24 @@ func NuevoMotor(reg prometheus.Registerer) *Motor {
 			Buckets: BucketsFase,
 		}, []string{"fase"}),
 	}
-	reg.MustRegister(m.decisiones, m.dremLlegada, m.slack, m.fase)
+	m.registradas = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "drts_respuestas_registradas_total",
+		Help: "Reintentos respondidos con lo que Settlement ya había registrado, sin volver a evaluar (ADR-0027), por estado.",
+	}, []string{"estado"})
+	// En 0 desde el arranque: "ningún reintento resuelto así" no es lo mismo
+	// que "la métrica no existe".
+	for _, e := range []string{"STATUS_COMMITTED", "STATUS_REJECTED_FRAUD"} {
+		m.registradas.WithLabelValues(e)
+	}
+	reg.MustRegister(m.decisiones, m.dremLlegada, m.slack, m.fase, m.registradas)
 	return m
+}
+
+// RespuestaRegistrada cuenta un reintento respondido con lo ya registrado.
+func (m *Motor) RespuestaRegistrada(estado string) {
+	if m != nil {
+		m.registradas.WithLabelValues(estado).Inc()
+	}
 }
 
 // DRemLlegada registra el D_rem con el que llegó una request.

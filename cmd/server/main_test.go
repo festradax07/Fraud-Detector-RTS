@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -428,8 +429,32 @@ func TestSettlementRegistraLaDecision(t *testing.T) {
 	}
 }
 
-// Política ante fallas de Settlement: una aprobada sin commit es error
-// (fail-closed); un rechazo se responde igual.
+// settlementCaido devuelve un cliente de Settlement apuntando a un puerto sin
+// nadie: cualquier llamada falla en µs. Sirve también para comprobar que el
+// motor NO llama a Settlement (si lo llamara, la respuesta sería un error).
+//
+// Como en producción: el server hace Connect() al arrancar, así que cuando
+// llega la primera transacción el canal ya sabe que Settlement está caído
+// (TRANSIENT_FAILURE) y falla en µs. Un canal recién creado, en cambio,
+// espera el primer intento de conexión (medido: ~9ms con "localhost", que
+// pasa por DNS).
+func settlementCaido(t *testing.T) pb.SettlementClient {
+	t.Helper()
+	conn, err := grpc.NewClient("localhost:1", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("cliente: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	esperarEstado(t, conn, connectivity.TransientFailure)
+	return pb.NewSettlementClient(conn)
+}
+
+// Política ante fallas de Settlement (ADR-0027): sin saber qué quedó
+// registrado no se responde una decisión, ni aprobada ni rechazada. Las dos
+// salen como error ambiguo y el cliente reintenta.
+//
+// Cómo estaba (hasta ADR-0027): el rechazo se respondía igual. Ver
+// TestRechazoEnCarreraConUnCommit, que muestra por qué estaba mal.
 func TestSettlementFalla(t *testing.T) {
 	casos := []struct {
 		nombre string
@@ -438,19 +463,8 @@ func TestSettlementFalla(t *testing.T) {
 		wantCode codes.Code // para la aprobada
 		maxTardo time.Duration
 	}{
-		// Como en producción: el server hace Connect() al arrancar, así que
-		// cuando llega la primera transacción el canal ya sabe que
-		// Settlement está caído (TRANSIENT_FAILURE) y falla en µs. Un canal
-		// recién creado, en cambio, espera el primer intento de conexión
-		// (medido: ~9ms con "localhost", que pasa por DNS).
 		{"Settlement caído", func(t *testing.T, _ *fraudEngineServer) pb.SettlementClient {
-			conn, err := grpc.NewClient("localhost:1", grpc.WithTransportCredentials(insecure.NewCredentials()))
-			if err != nil {
-				t.Fatalf("cliente: %v", err)
-			}
-			t.Cleanup(func() { conn.Close() })
-			esperarEstado(t, conn, connectivity.TransientFailure)
-			return pb.NewSettlementClient(conn)
+			return settlementCaido(t)
 		}, codes.Unavailable, 5 * time.Millisecond},
 		// Tarda 100ms: el timeout propio (ReservaSettleNet = 15ms) corta
 		// mucho antes que el deadline del cliente.
@@ -479,9 +493,10 @@ func TestSettlementFalla(t *testing.T) {
 				t.Errorf("aprobada: tardó %v, se esperaba menos de %v", tardo, c.maxTardo)
 			}
 
+			// El rechazo tampoco se responde sin registro: mismo error ambiguo.
 			resp, err := evaluar(t, s, txValida("t2", "tok-robada", baLat, baLon))
-			if err != nil || !resp.IsFraud || resp.RejectionReason != mandatoria.MotivoBlacklist {
-				t.Errorf("rechazo: resp=%+v err=%v, se esperaba el rechazo igual", resp, err)
+			if got := status.Code(err); got != c.wantCode || resp != nil {
+				t.Errorf("rechazo: resp=%+v código=%v, se esperaba error %v (ambiguo, no una decisión)", resp, got, c.wantCode)
 			}
 		})
 	}
@@ -499,6 +514,16 @@ func TestTransaccionTardiaNoSeCompromete(t *testing.T) {
 	_, err := evaluar(t, s, req)
 	if status.Code(err) != codes.DeadlineExceeded {
 		t.Errorf("código = %v, se esperaba DeadlineExceeded (err=%v)", status.Code(err), err)
+	}
+
+	// ABORTED_TIMEOUT no es un resultado final: un reintento a tiempo NO se
+	// responde con lo registrado (ADR-0027), se evalúa y se compromete.
+	req.EmissionTimestampNs = time.Now().UnixNano()
+	if resp, err := evaluar(t, s, req); err != nil || resp.IsFraud {
+		t.Fatalf("reintento a tiempo: resp=%+v err=%v, se esperaba aprobada", resp, err)
+	}
+	if got := estadoRegistrado(t, s, "t1"); got != "STATUS_COMMITTED" {
+		t.Errorf("tras el reintento: registrada como %q, se esperaba STATUS_COMMITTED", got)
 	}
 }
 
@@ -540,8 +565,9 @@ func TestAmbiguedadDelTimeout(t *testing.T) {
 		t.Fatalf("Bloquear: %v", err)
 	}
 
-	// 3. Reintento con el mismo tx_id: manda lo registrado. La plata ya se
-	// comprometió, así que la respuesta es "aprobada".
+	// 3. Reintento con el mismo tx_id: el motor encuentra el registro en el
+	// viaje 1 a Redis y responde eso (ADR-0027). La plata ya se comprometió,
+	// así que la respuesta es "aprobada".
 	s.settle = normal
 	resp, err := evaluar(t, s, txValida("t1", "tok-ok", baLat, baLon))
 	if err != nil {
@@ -552,6 +578,145 @@ func TestAmbiguedadDelTimeout(t *testing.T) {
 	}
 	if est, _ := rdb.HGet(context.Background(), clave, "estado").Result(); est != "STATUS_COMMITTED" {
 		t.Errorf("registro tras el reintento = %q, se esperaba STATUS_COMMITTED", est)
+	}
+}
+
+// Un reintento de algo que ya tiene resultado final se responde con lo
+// registrado, sin volver a evaluar ni llamar a Settlement (ADR-0027). Con
+// la Computación Imprecisa, dos intentos de la misma transacción pueden
+// decidir distinto: el primero degradado (sin scoring), el reintento con
+// scoring. Lo que vale es lo registrado.
+func TestReintentoRespondeLoRegistrado(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("comprometida degradada; el reintento daría RIESGO_ALTO", func(t *testing.T) {
+		s, rdb, prefijo := nuevoServerConRedis(t)
+		req := conMonto(txValida("t1", "tok-ok", baLat, baLon), montoConZ(4))
+
+		// 1. Llega con 60ms: sin slack, se degrada y se aprueba. Settlement
+		// compromete pero la respuesta se pierde: el cliente ve un error.
+		s.settle = levantarSettlement(t, settlementRespuestaPerdida{settlement.NuevoServidor(rdb, prefijo, nil, 0), 30 * time.Millisecond})
+		if _, err := evaluarCon(t, s, req, 60*time.Millisecond); fallas.Motivo(err) != fallas.SettlementTimeout {
+			t.Fatalf("primer intento: err=%v, se esperaba %s", err, fallas.SettlementTimeout)
+		}
+
+		// 2. Reintento con 200ms: si se evaluara, correría el scoring y daría
+		// RIESGO_ALTO. Settlement caído: si el motor lo llamara, sería error.
+		s.settle = settlementCaido(t)
+		resp, err := evaluar(t, s, req)
+		if err != nil {
+			t.Fatalf("reintento: %v (¿llamó a Settlement en vez de usar lo registrado?)", err)
+		}
+		if resp.IsFraud || !resp.IsDegraded {
+			t.Errorf("reintento: is_fraud=%v (%s) degradada=%v, se esperaba lo registrado: aprobada y degradada",
+				resp.IsFraud, resp.RejectionReason, resp.IsDegraded)
+		}
+	})
+
+	// Si el intento anterior quedó registrado pero Settlement no llegó a
+	// enterarse (la respuesta de Redis no volvió a tiempo), nunca publicó el
+	// evento. El reintento le reenvía lo registrado para que lo publique,
+	// sin depender de esa llamada para responder.
+	t.Run("le reenvía lo registrado a Settlement", func(t *testing.T) {
+		s, rdb, prefijo := nuevoServerConRedis(t)
+		req := txValida("t3", "tok-ok", baLat, baLon)
+		if _, err := evaluar(t, s, req); err != nil {
+			t.Fatalf("primer intento: %v", err)
+		}
+		cont := &settlementContador{Servidor: settlement.NuevoServidor(rdb, prefijo, nil, 0)}
+		s.settle = levantarSettlement(t, cont)
+		if resp, err := evaluar(t, s, req); err != nil || resp.IsFraud {
+			t.Fatalf("reintento: resp=%+v err=%v, se esperaba aprobada", resp, err)
+		}
+		if n := cont.llamadas.Load(); n != 1 {
+			t.Errorf("Settlement recibió %d llamadas, se esperaba 1 (el reenvío de lo registrado)", n)
+		}
+		if got := estadoRegistrado(t, s, "t3"); got != "STATUS_COMMITTED" {
+			t.Errorf("registro = %q, se esperaba STATUS_COMMITTED sin cambios", got)
+		}
+	})
+
+	t.Run("rechazada por blacklist; al reintentar ya no está", func(t *testing.T) {
+		s, rdb, prefijo := nuevoServerConRedis(t)
+		req := txValida("t2", "tok-robada", baLat, baLon)
+		if resp, err := evaluar(t, s, req); err != nil || !resp.IsFraud {
+			t.Fatalf("primer intento: resp=%+v err=%v, se esperaba rechazada", resp, err)
+		}
+		if err := rdb.SRem(ctx, prefijo+"blacklist", "tok-robada").Err(); err != nil {
+			t.Fatalf("SRem: %v", err)
+		}
+
+		s.settle = settlementCaido(t)
+		resp, err := evaluar(t, s, req)
+		if err != nil {
+			t.Fatalf("reintento: %v", err)
+		}
+		if !resp.IsFraud || resp.RejectionReason != mandatoria.MotivoBlacklist {
+			t.Errorf("reintento: is_fraud=%v motivo=%q, se esperaba lo registrado: rechazada por %s",
+				resp.IsFraud, resp.RejectionReason, mandatoria.MotivoBlacklist)
+		}
+	})
+}
+
+// settlementContador es un Settlement real que cuenta sus llamadas.
+type settlementContador struct {
+	*settlement.Servidor
+	llamadas atomic.Int64
+}
+
+func (s *settlementContador) CommitTransaction(ctx context.Context, req *pb.SettlementRequest) (*pb.SettlementResponse, error) {
+	s.llamadas.Add(1)
+	return s.Servidor.CommitTransaction(ctx, req)
+}
+
+// settlementCommitEnVuelo simula la carrera que encontró la auditoría en la
+// corrida del día completo: mientras el motor espera a Settlement, el
+// COMMIT de un intento anterior del mismo tx_id (que seguía en vuelo) llega
+// primero, y la respuesta de esta llamada no llega a tiempo.
+type settlementCommitEnVuelo struct {
+	*settlement.Servidor
+	demora time.Duration
+}
+
+func (s settlementCommitEnVuelo) CommitTransaction(ctx context.Context, req *pb.SettlementRequest) (*pb.SettlementResponse, error) {
+	// El intento anterior: aprobado (degradado) y comprometido.
+	anterior := &pb.SettlementRequest{TxId: req.TxId, UserId: req.UserId, Amount: req.Amount,
+		Evaluation: &pb.EvaluationResponse{TxId: req.TxId, IsDegraded: true}}
+	if _, err := s.Servidor.CommitTransaction(ctx, anterior); err != nil {
+		return nil, err
+	}
+	time.Sleep(s.demora) // esta llamada vence esperando
+	return s.Servidor.CommitTransaction(ctx, req)
+}
+
+// El bug que encontró la auditoría (50 INCONSISTENTE en un día de carga):
+// el reintento evaluaba de nuevo, daba fraude, Settlement no respondía a
+// tiempo, y el motor respondía "rechazada" mientras un intento anterior ya
+// había comprometido la plata. ADR-0027: si Settlement falla, la respuesta
+// es ambigua también para un rechazo, y el siguiente reintento responde lo
+// registrado.
+func TestRechazoEnCarreraConUnCommit(t *testing.T) {
+	s, rdb, prefijo := nuevoServerConRedis(t)
+	req := conMonto(txValida("t1", "tok-ok", baLat, baLon), montoConZ(4)) // con scoring: RIESGO_ALTO
+	s.settle = levantarSettlement(t, settlementCommitEnVuelo{settlement.NuevoServidor(rdb, prefijo, nil, 0), 30 * time.Millisecond})
+
+	resp, err := evaluar(t, s, req)
+	if err == nil {
+		t.Fatalf("respondió una decisión (is_fraud=%v %s) sin saber qué quedó registrado; se esperaba un error ambiguo",
+			resp.IsFraud, resp.RejectionReason)
+	}
+	if fallas.Motivo(err) != fallas.SettlementTimeout {
+		t.Errorf("motivo = %q, se esperaba %s (ambiguo: el cliente reintenta)", fallas.Motivo(err), fallas.SettlementTimeout)
+	}
+	if got := estadoRegistrado(t, s, "t1"); got != "STATUS_COMMITTED" {
+		t.Fatalf("registro = %q, se esperaba STATUS_COMMITTED (lo comprometió el intento anterior)", got)
+	}
+
+	// El reintento converge a lo registrado: aprobada.
+	s.settle = settlementCaido(t)
+	resp, err = evaluar(t, s, req)
+	if err != nil || resp.IsFraud {
+		t.Errorf("reintento: resp=%+v err=%v, se esperaba aprobada (lo registrado)", resp, err)
 	}
 }
 

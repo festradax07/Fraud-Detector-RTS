@@ -154,7 +154,9 @@ flowchart TB
 Dos reglas atraviesan todo: **fail-closed** (si no se puede verificar, no se
 aprueba, [ADR-0009](docs/adr/0009-fail-closed-y-fallo-rapido.md)) y
 **idempotencia por `tx_id`** (reintentar una transacción no cambia su
-resultado, [ADR-0013](docs/adr/0013-ambiguedad-del-timeout-e-idempotencia.md)).
+resultado, [ADR-0013](docs/adr/0013-ambiguedad-del-timeout-e-idempotencia.md):
+un reintento responde lo que ya quedó registrado,
+[ADR-0027](docs/adr/0027-reintento-responde-lo-registrado.md)).
 
 En Docker Compose cada capa vive en su propia red privada (`aplicacion`,
 `datos`, `observabilidad`), y los servicios se conectan solo a las que
@@ -200,7 +202,9 @@ flowchart TD
     D -- no --> X3[InvalidArgument<br/>REQUEST_INVALIDA /<br/>CATEGORIA_DESCONOCIDA]
     D -- sí --> E{¿Redis respondió?}
     E -- no --> X4[Unavailable / DeadlineExceeded<br/>REDIS_*: no se pudo decidir]
-    E -- sí --> F{Mandatoria}
+    E -- sí --> K{¿El tx_id ya tiene<br/>resultado final registrado?}
+    K -- "sí (es un reintento)" --> RR[OK · lo registrado,<br/>sin volver a evaluar]
+    K -- no --> F{Mandatoria}
     F -- blacklist --> R1[BLACKLIST]
     F -- "más de 3 intentos en 10s" --> R2[CARD_TESTING]
     F -- "más de 800 km/h" --> R3[VIAJE_IMPOSIBLE]
@@ -213,7 +217,8 @@ flowchart TD
     R2 --> RS
     R3 --> RS
     R4 --> RS
-    RS -- "aunque falle Settlement:<br/>el rechazo es la decisión segura" --> RF[OK · is_fraud<br/>+ motivo]
+    RS -- registrado --> RF[OK · is_fraud<br/>+ motivo]
+    RS -- "timeout / caído" --> X5
     H --> J{Settlement}
     H2 --> J
     J -- COMMITTED --> OK[OK · aprobada]
@@ -224,7 +229,11 @@ flowchart TD
 Por qué un fraude es una respuesta `OK` y no un error, y cómo se distinguen
 los motivos: [ADR-0005](docs/adr/0005-fraude-no-es-error.md). Por qué un
 timeout esperando a Settlement es "resultado desconocido" y cómo se resuelve:
-[ADR-0013](docs/adr/0013-ambiguedad-del-timeout-e-idempotencia.md).
+[ADR-0013](docs/adr/0013-ambiguedad-del-timeout-e-idempotencia.md). Por qué
+un reintento responde lo registrado sin volver a evaluar, y por qué un
+rechazo sin registro confirmado también es ambiguo:
+[ADR-0027](docs/adr/0027-reintento-responde-lo-registrado.md) (lo encontró
+la auditoría bajo carga).
 
 ## Componentes
 
@@ -232,7 +241,7 @@ timeout esperando a Settlement es "resultado desconocido" y cómo se resuelve:
 
 | Binario | Qué hace | ADRs |
 |---|---|---|
-| [`server`](cmd/server/main.go) | **Fraud-Engine.** Admisión, validación, fase mandatoria contra Redis, slack, fase opcional y liquidación con Settlement. Puerto gRPC `:50051`, métricas `:2112`. | 0002–0009, 0012, 0013 |
+| [`server`](cmd/server/main.go) | **Fraud-Engine.** Admisión, validación, fase mandatoria contra Redis, slack, fase opcional y liquidación con Settlement. Puerto gRPC `:50051`, métricas `:2112`. | 0002–0009, 0012, 0013, 0027 |
 | [`settlement`](cmd/settlement/main.go) | **Settlement.** Registra cada decisión (`COMMITTED`, `REJECTED_FRAUD`, `ABORTED_TIMEOUT`) de forma idempotente y calcula la latencia de extremo a extremo. Puerto `:50052`, métricas `:2113`. | 0012, 0013 |
 | [`loadgen`](cmd/loadgen/main.go) | **Generador de carga** de lazo abierto (llegadas de Poisson). Tasa fija o un **perfil del día** con picos ([`perfiles/`](perfiles/)). Mide la latencia desde el instante programado, clasifica resultados y reintenta los ambiguos. Métricas `:2114`. | 0014, 0026 |
 | [`cargar-stats`](cmd/cargar-stats/main.go) | Calcula media, desvío y peso de riesgo por categoría (algoritmo de Welford) desde el dataset y los guarda en Redis. | 0010 |
@@ -469,6 +478,10 @@ dashboard **"D-RTS — Tiempo real"** se lee de arriba hacia abajo:
    discrepancias contadas aparte), alertas por motivo y deriva de las
    estadísticas en sombra. Con Kafka caído, las filas 1–4 no cambian: es la
    forma de verlo.
+
+Qué muestra cada panel, cómo leerlo, cómo diagnosticar con él y qué
+métricas comparar entre entornos:
+[observabilidad/GUIA-DASHBOARD.md](observabilidad/GUIA-DASHBOARD.md).
 
 Prometheus scrapea las dos formas de correr el sistema con la etiqueta
 `entorno` (`nativo` / `compose`), con el mismo dashboard. El interceptor de
