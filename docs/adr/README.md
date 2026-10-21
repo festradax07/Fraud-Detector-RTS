@@ -37,10 +37,13 @@ escriben: [ADR-0001](0001-registrar-decisiones-con-adrs.md) y la
 | [0016](0016-tests-contra-infraestructura-real.md) | Los tests usan infraestructura real | Aceptada | 3 en adelante |
 | [0017](0017-configuracion-por-entorno-y-apagado-ordenado.md) | Configuración por entorno y apagado ordenado | Aceptada | 7.5 |
 | [0018](0018-evaluar-en-distintos-entornos.md) | Evaluar el sistema real en distintos entornos, no contra un simulador | Aceptada | transversal (afecta a 7.5, la etapa de nube y la calibración) |
-| [0019](0019-kafka-como-columna-de-eventos.md) | Kafka como columna de eventos, fuera del camino de decisión | Aceptada (pendiente de implementación) | 8 (pasa a ser parte del núcleo) |
+| [0019](0019-kafka-como-columna-de-eventos.md) | Kafka como columna de eventos, fuera del camino de decisión | Aceptada (implementada: ADR-0023, ADR-0024, ADR-0025) | 8 (pasa a ser parte del núcleo) |
 | [0020](0020-imagenes-salud-y-compose.md) | Imágenes distroless, salud por gRPC y Compose por perfiles | Aceptada | 7.5 |
 | [0021](0021-logs-con-niveles.md) | Logs estructurados con niveles; el detalle por transacción en Debug | Aceptada | refactor posterior a la 7.5 |
 | [0022](0022-conexion-caida-es-resultado-ambiguo.md) | Una conexión caída con la request en vuelo es un resultado ambiguo | Aceptada | refactor posterior a la 7.5 (complementa a ADR-0013) |
+| [0023](0023-redes-como-subredes-privadas.md) | Redes del Compose como subredes privadas; Kafka como unidad aparte | Aceptada | 8 (Kafka) |
+| [0024](0024-eventos-en-protobuf-sin-bloquear.md) | Eventos en protobuf, publicados sin bloquear | Aceptada | 8 (Kafka) |
+| [0025](0025-consumidores-y-auditoria.md) | Consumidores del cold path; la auditoría cruza los dos lados | Aceptada | 8 (Kafka) |
 
 ## Cómo leerlos
 
@@ -52,4 +55,4 @@ escriben: [ADR-0001](0001-registrar-decisiones-con-adrs.md) y la
   0010 (scoring).
 - **Medir y operar:** 0014 (load generator), 0015 (observabilidad), 0016
   (tests reales), 0017 (configuración y apagado), 0018 (entornos), 0019
-  (Kafka), 0020 (imágenes, salud y Compose), 0021 (logs).
+  (Kafka), 0020 (imágenes, salud y Compose), 0021 (logs), 0023 (redes), 0024 (eventos), 0025 (consumidores y auditoría).

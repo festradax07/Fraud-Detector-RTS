@@ -7,11 +7,14 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kgo"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
@@ -78,4 +81,78 @@ func ServirGRPC(t testing.TB, registrar func(g *grpc.Server)) *grpc.ClientConn {
 		g.Stop()
 	})
 	return conn
+}
+
+// KafkaBrokers es el Kafka real de los tests (KAFKA_BROKERS, por defecto el
+// de "make kafka-up").
+func KafkaBrokers() []string {
+	return strings.Split(config.Texto("KAFKA_BROKERS", "localhost:9092"), ",")
+}
+
+// Kafka verifica que el Kafka real responda y crea un topic ÚNICO para este
+// test por cada nombre pedido (con una partición, así el orden de lectura es
+// el de escritura). Devuelve los brokers y los nombres reales, en el mismo
+// orden. Al terminar, borra los topics.
+//
+// Si Kafka no está levantado, el test FALLA (no se saltea).
+func Kafka(t testing.TB, nombres ...string) (brokers []string, topics []string) {
+	t.Helper()
+	brokers = KafkaBrokers()
+	cl, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
+	if err != nil {
+		t.Fatalf("cliente Kafka: %v", err)
+	}
+	adm := kadm.NewClient(cl)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := adm.ListBrokers(ctx); err != nil {
+		cl.Close()
+		t.Fatalf("Kafka no responde en %v (levantalo con: make kafka-up): %v", brokers, err)
+	}
+
+	// Guiones y no guiones bajos: Kafka avisa que mezclar "." y "_" en los
+	// nombres puede hacer chocar sus métricas.
+	base := fmt.Sprintf("test-%d-%d-%d", os.Getpid(), time.Now().UnixNano(), contador.Add(1))
+	for _, n := range nombres {
+		topics = append(topics, base+"-"+n)
+	}
+	res, err := adm.CreateTopics(ctx, 1, 1, nil, topics...)
+	if err == nil {
+		err = res.Error()
+	}
+	if err != nil {
+		cl.Close()
+		t.Fatalf("creando topics de prueba: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		adm.DeleteTopics(ctx, topics...)
+		cl.Close()
+	})
+	return brokers, topics
+}
+
+// LeerKafka consume n registros de topic desde el principio (Kafka real) y
+// falla el test si no llegan en 10s.
+func LeerKafka(t testing.TB, brokers []string, topic string, n int) []*kgo.Record {
+	t.Helper()
+	cl, err := kgo.NewClient(kgo.SeedBrokers(brokers...), kgo.ConsumeTopics(topic),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()))
+	if err != nil {
+		t.Fatalf("consumidor: %v", err)
+	}
+	defer cl.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var recs []*kgo.Record
+	for len(recs) < n {
+		f := cl.PollFetches(ctx)
+		if ctx.Err() != nil {
+			t.Fatalf("leídos %d de %d registros de %s antes del timeout", len(recs), n, topic)
+		}
+		recs = append(recs, f.Records()...)
+	}
+	return recs
 }

@@ -7,8 +7,8 @@
 // puede importar: los tests del Fraud-Engine levantan este mismo servidor,
 // real, en un puerto TCP real.
 //
-// El registro va a Redis. Los eventos de auditoría asíncronos (Kafka, fuera
-// del camino de decisión) están planificados en ADR-0019.
+// El registro va a Redis, con TTL; el registro durable es la auditoría, a
+// partir de los eventos que publica en Kafka (ADR-0019, ADR-0025).
 package settlement
 
 import (
@@ -24,6 +24,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 
+	"fd_rts/internal/eventos"
 	"fd_rts/internal/fallas"
 	"fd_rts/internal/presupuesto"
 	"fd_rts/internal/registro"
@@ -45,9 +46,16 @@ import (
 const TrailerSettleUs = "x-settle-us"
 
 // NuevoServidor arma el servicio sobre un cliente de Redis. prefijo separa
-// las claves ("drts:" en el servicio, uno único por test).
-func NuevoServidor(rdb *redis.Client, prefijo string) *Servidor {
-	return &Servidor{rdb: rdb, prefijo: prefijo}
+// las claves ("drts:" en el servicio, uno único por test). eventos publica
+// cada registro en Kafka sin bloquear; nil = deshabilitado. ttl es cuánto
+// vive cada registro en Redis (0 = sin vencimiento).
+//
+// Por qué TTL: el registro durable es la auditoría (los eventos en Kafka,
+// ADR-0025). El de Redis solo tiene que durar mientras un cliente pueda
+// reintentar el mismo tx_id: es lo que necesita la idempotencia (ADR-0013).
+// Sin TTL crecía sin límite (~1M de claves por hora a 300 RPS).
+func NuevoServidor(rdb *redis.Client, prefijo string, eventos *eventos.Productor, ttl time.Duration) *Servidor {
+	return &Servidor{rdb: rdb, prefijo: prefijo, eventos: eventos, ttl: ttl}
 }
 
 // Servidor implementa el servicio Settlement del .proto.
@@ -56,6 +64,8 @@ type Servidor struct {
 	rdb *redis.Client
 	// prefijo de claves: "drts:" en el servicio, uno único por test.
 	prefijo string
+	eventos *eventos.Productor
+	ttl     time.Duration
 }
 
 // ClaveRegistro es la clave de Redis donde queda el registro de txID.
@@ -114,11 +124,10 @@ func (s *Servidor) CommitTransaction(ctx context.Context, req *pb.SettlementRequ
 	}
 
 	// Registro en Redis, con el script registrarUnaVez: si el tx_id ya tiene
-	// un resultado final, gana ese (idempotencia de verdad).
-	//
-	// Sin TTL: es el registro de la transacción. Cuando la auditoría pase a
-	// Kafka (ADR-0019), Redis podrá guardarlo con TTL.
+	// un resultado final, gana ese (idempotencia de verdad). El primer
+	// argumento es el TTL en segundos; después, los campos.
 	campos := []any{
+		int64(s.ttl.Seconds()),
 		"estado", estado.String(),
 		"user_id", req.UserId,
 		"amount", req.Amount,
@@ -152,6 +161,18 @@ func (s *Servidor) CommitTransaction(ctx context.Context, req *pb.SettlementRequ
 	if registro.Depurando(ctx) {
 		slog.DebugContext(ctx, "registrada", "tx_id", req.TxId, "estado", registrado, "latencia_e2e", latencia)
 	}
+	// Lo que quedó registrado, al cold path (no bloquea). En un reintento se
+	// vuelve a publicar el mismo resultado: los consumidores son idempotentes
+	// por tx_id (ADR-0013).
+	s.eventos.PublicarLiquidada(&pb.TransaccionLiquidada{
+		TxId:            req.TxId,
+		UserId:          req.UserId,
+		Amount:          req.Amount,
+		Estado:          registrado,
+		RejectionReason: motivo,
+		LatenciaE2EUs:   latencia.Microseconds(),
+		RegistradoNs:    inicio.UnixNano(),
+	})
 	// Message: para un rechazo, el motivo registrado (el motor lo necesita si
 	// un reintento se evaluó distinto); si no, el nombre del estado.
 	mensaje := registrado.String()
@@ -178,10 +199,14 @@ func (s *Servidor) CommitTransaction(ctx context.Context, req *pb.SettlementRequ
 // comandos de otros clientes: es atómico, y es un solo viaje de red.
 //
 // En Lua, HGET de un campo inexistente devuelve false (no nil).
+// ARGV[1] es el TTL en segundos (0 = sin vencimiento); unpack(ARGV, 2) son
+// los pares campo/valor.
 var registrarUnaVez = redis.NewScript(fmt.Sprintf(`
 local actual = redis.call('HGET', KEYS[1], 'estado')
 if actual ~= %q and actual ~= %q then
-  redis.call('HSET', KEYS[1], unpack(ARGV))
+  redis.call('HSET', KEYS[1], unpack(ARGV, 2))
+  local ttl = tonumber(ARGV[1])
+  if ttl > 0 then redis.call('EXPIRE', KEYS[1], ttl) end
 end
 return {redis.call('HGET', KEYS[1], 'estado'), redis.call('HGET', KEYS[1], 'rejection_reason') or ''}
 `, pb.TxStatus_STATUS_COMMITTED.String(), pb.TxStatus_STATUS_REJECTED_FRAUD.String()))

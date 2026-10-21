@@ -25,6 +25,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"fd_rts/internal/config"
+	"fd_rts/internal/eventos"
 	"fd_rts/internal/fallas"
 	"fd_rts/internal/mandatoria"
 	"fd_rts/internal/metricas"
@@ -56,6 +57,7 @@ type configuracion struct {
 	redisAddr      string        // REDIS_ADDR
 	redisPrefijo   string        // REDIS_PREFIJO: prefijo de las claves
 	settlementAddr string        // SETTLEMENT_ADDR
+	kafkaBrokers   []string      // KAFKA_BROKERS: vacío = eventos deshabilitados
 	iteraciones    int           // ITERACIONES_SCORING: costo simulado del scoring
 	esperaApagado  time.Duration // APAGADO_ESPERA: máximo para drenar requests en vuelo
 	avisoApagado   time.Duration // APAGADO_AVISO: NOT_SERVING antes de dejar de atender
@@ -68,6 +70,7 @@ func leerConfiguracion() (configuracion, error) {
 		redisAddr:      config.Texto("REDIS_ADDR", redisAddrPorDefecto),
 		redisPrefijo:   config.Texto("REDIS_PREFIJO", redisclient.PrefijoPorDefecto),
 		settlementAddr: config.Texto("SETTLEMENT_ADDR", "localhost:50052"),
+		kafkaBrokers:   eventos.Brokers(config.Texto("KAFKA_BROKERS", "")),
 	}
 	var err error
 	if c.iteraciones, err = config.Entero("ITERACIONES_SCORING", iteracionesPorDefecto); err != nil {
@@ -101,12 +104,23 @@ type fraudEngineServer struct {
 	// metricas del modelo temporal. Puede ser nil: los métodos no hacen nada
 	// en ese caso.
 	metricas *metricas.Motor
+	// eventos publica en Kafka, sin bloquear (ADR-0019). Puede ser nil:
+	// Kafka deshabilitado.
+	eventos *eventos.Productor
+}
+
+// traza junta lo que se mide de una transacción a lo largo del handler,
+// para el evento que se publica al final.
+type traza struct {
+	dremLlegada time.Duration // D_rem al llegar
+	slack       time.Duration // slack al decidir la opcional
 }
 
 func (s *fraudEngineServer) EvaluateTransaction(ctx context.Context, req *pb.TransactionRequest) (*pb.EvaluationResponse, error) {
 	inicio := time.Now()
+	var tr traza
 
-	deadline, err := s.admitir(ctx)
+	deadline, err := s.admitir(ctx, &tr)
 	if err != nil {
 		return nil, err
 	}
@@ -124,16 +138,16 @@ func (s *fraudEngineServer) EvaluateTransaction(ctx context.Context, req *pb.Tra
 			slog.DebugContext(ctx, "fraude", "tx_id", req.TxId, "motivo", motivo,
 				"intentos", res.Intentos, "kmh", res.Kmh)
 		}
-		return s.liquidar(ctx, req, rechazo(req, motivo, 0), inicio)
+		return s.liquidar(ctx, req, rechazo(req, motivo, 0), inicio, tr)
 	}
 
 	// --- Fase opcional (O_i) ---
-	score, degradada := s.faseOpcional(ctx, req, stats, deadline)
+	score, degradada := s.faseOpcional(ctx, req, stats, deadline, &tr)
 	if score > opcional.UmbralRechazo {
 		if registro.Depurando(ctx) {
 			slog.DebugContext(ctx, "fraude", "tx_id", req.TxId, "motivo", opcional.MotivoRiesgoAlto, "score", score)
 		}
-		return s.liquidar(ctx, req, rechazo(req, opcional.MotivoRiesgoAlto, score), inicio)
+		return s.liquidar(ctx, req, rechazo(req, opcional.MotivoRiesgoAlto, score), inicio, tr)
 	}
 
 	// Pasó todos los chequeos: recién ahora esta posición pasa a ser
@@ -151,7 +165,7 @@ func (s *fraudEngineServer) EvaluateTransaction(ctx context.Context, req *pb.Tra
 		TxId:       req.TxId,
 		RiskScore:  score,
 		IsDegraded: degradada,
-	}, inicio)
+	}, inicio, tr)
 }
 
 // admitir es el control de admisión (ADR-0003): va ANTES de cualquier
@@ -160,12 +174,13 @@ func (s *fraudEngineServer) EvaluateTransaction(ctx context.Context, req *pb.Tra
 //
 // Una llamada sin deadline se rechaza: es un bug del cliente, y procesarla
 // "sin límite" lo taparía (ADR-0002).
-func (s *fraudEngineServer) admitir(ctx context.Context) (time.Time, error) {
+func (s *fraudEngineServer) admitir(ctx context.Context, tr *traza) (time.Time, error) {
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		return time.Time{}, fallas.Nueva(codes.InvalidArgument, fallas.SinDeadline, "la llamada debe traer un deadline")
 	}
 	restante := time.Until(deadline) // D_rem
+	tr.dremLlegada = restante
 	// Si este valor baja de ~200ms, hay espera ANTES del handler.
 	s.metricas.DRemLlegada(restante)
 	if !presupuesto.Admitir(restante) {
@@ -233,9 +248,10 @@ func (s *fraudEngineServer) consultar(ctx context.Context, req *pb.TransactionRe
 // ahora, con la mandatoria y el viaje a Redis ya pagados. Sin slack, la
 // respuesta sale degradada (solo mandatoria): se acepta el riesgo de no
 // haber puntuado a cambio de cumplir el deadline.
-func (s *fraudEngineServer) faseOpcional(ctx context.Context, req *pb.TransactionRequest, stats opcional.Estadisticas, deadline time.Time) (score float64, degradada bool) {
+func (s *fraudEngineServer) faseOpcional(ctx context.Context, req *pb.TransactionRequest, stats opcional.Estadisticas, deadline time.Time, tr *traza) (score float64, degradada bool) {
 	restante := time.Until(deadline)
 	slack := presupuesto.Slack(restante)
+	tr.slack = slack
 	s.metricas.Slack(slack)
 	if !presupuesto.CorreOpcional(restante) {
 		if registro.Depurando(ctx) {
@@ -273,7 +289,13 @@ func rechazo(req *pb.TransactionRequest, motivo string, score float64) *pb.Evalu
 //   - Aprobada: fail-closed. Sin commit confirmado no se responde "aprobada".
 //   - Rechazada: la decisión de rechazar ya es la segura. Se responde igual
 //     y queda en el log que se perdió el registro.
-func (s *fraudEngineServer) liquidar(ctx context.Context, req *pb.TransactionRequest, eval *pb.EvaluationResponse, inicio time.Time) (*pb.EvaluationResponse, error) {
+//
+// Toda salida de liquidar publica el evento TransaccionEvaluada (el defer):
+// las decisiones y también las fallas de Settlement, que la auditoría
+// necesita para detectar las ambiguas que quedaron comprometidas.
+func (s *fraudEngineServer) liquidar(ctx context.Context, req *pb.TransactionRequest, eval *pb.EvaluationResponse, inicio time.Time, tr traza) (resp *pb.EvaluationResponse, err error) {
+	defer func() { s.publicarEvaluada(req, resp, err, tr) }()
+
 	ctxSettle, cancel := context.WithTimeout(ctx, presupuesto.ReservaSettleNet)
 	defer cancel()
 
@@ -299,6 +321,27 @@ func (s *fraudEngineServer) liquidar(ctx context.Context, req *pb.TransactionReq
 		return nil, fallaDeSettlement(ctx, req.TxId, err)
 	}
 	return respuestaSegunRegistro(ctx, req.TxId, eval, sr)
+}
+
+// publicarEvaluada publica el evento de lo que el motor respondió. No
+// bloquea ni falla (internal/eventos): si Kafka no está, se descarta y se
+// cuenta.
+func (s *fraudEngineServer) publicarEvaluada(req *pb.TransactionRequest, resp *pb.EvaluationResponse, err error, tr traza) {
+	if s.eventos == nil {
+		return
+	}
+	s.eventos.PublicarEvaluada(&pb.TransaccionEvaluada{
+		TxId:             req.TxId,
+		CardToken:        req.CardToken,
+		UserId:           req.UserId,
+		Amount:           req.Amount,
+		MerchantCategory: req.MerchantCategory,
+		Evaluacion:       resp, // nil si no hubo decisión
+		ErrorMotivo:      fallas.Motivo(err),
+		EvaluadoNs:       time.Now().UnixNano(),
+		DremLlegadaUs:    tr.dremLlegada.Microseconds(),
+		SlackUs:          tr.slack.Microseconds(),
+	})
 }
 
 // medirSettlement registra la duración de la llamada y, si vino el trailer,
@@ -391,8 +434,8 @@ func main() {
 		registro.Fatal("configuración inválida", "error", err)
 	}
 	slog.Info("configuración", "grpc", cfg.grpcAddr, "metricas", cfg.metricasAddr, "redis", cfg.redisAddr,
-		"prefijo", cfg.redisPrefijo, "settlement", cfg.settlementAddr, "iteraciones", cfg.iteraciones,
-		"apagado", cfg.esperaApagado, "aviso", cfg.avisoApagado)
+		"prefijo", cfg.redisPrefijo, "settlement", cfg.settlementAddr, "kafka", cfg.kafkaBrokers,
+		"iteraciones", cfg.iteraciones, "apagado", cfg.esperaApagado, "aviso", cfg.avisoApagado)
 
 	ctx, stop := servicio.ContextoDeApagado()
 	defer stop()
@@ -428,6 +471,14 @@ func main() {
 	motor := metricas.NuevoMotor(reg)
 	srvMetricas := metricas.Servir(cfg.metricasAddr, reg)
 
+	// Eventos (ADR-0019): no conecta todavía, y si Kafka no está el motor
+	// arranca igual. Se cierra al final, DESPUÉS de drenar las requests en
+	// vuelo (que todavía publican).
+	productor, err := eventos.NuevoProductor(cfg.kafkaBrokers, eventos.TopicsPorDefecto, reg)
+	if err != nil {
+		registro.Fatal("productor de eventos", "error", err)
+	}
+
 	grpcServer := grpc.NewServer(grpc.UnaryInterceptor(rpc.Interceptor(func(resp any) {
 		if r, ok := resp.(*pb.EvaluationResponse); ok {
 			motor.Decision(r.IsFraud, r.RejectionReason, r.IsDegraded)
@@ -438,6 +489,7 @@ func main() {
 		settle:      pb.NewSettlementClient(connSettle),
 		iteraciones: cfg.iteraciones,
 		metricas:    motor,
+		eventos:     productor,
 	})
 	// Salud estándar de gRPC (ADR-0020), con Redis ya verificado: SERVING =
 	// listo para atender.
@@ -448,5 +500,10 @@ func main() {
 	if err := servicio.Correr(ctx, grpcServer, lis, salud, srvMetricas, plazos); err != nil {
 		slog.Warn("fraud-engine", "error", err)
 	}
+	// Las requests ya terminaron: entregar los eventos que quedaron en el
+	// buffer (como mucho APAGADO_ESPERA) antes de cerrar los clientes.
+	ctxFlush, cancel := context.WithTimeout(context.Background(), cfg.esperaApagado)
+	productor.Cerrar(ctxFlush)
+	cancel()
 	slog.Info("fraud-engine apagado")
 }

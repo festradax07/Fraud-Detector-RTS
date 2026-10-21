@@ -12,7 +12,32 @@
 # Prometheus scrapea las DOS formas de correr el sistema, con la etiqueta
 # entorno: "nativo" (binarios en el host) y "compose" (este archivo). Así
 # el mismo dashboard sirve para compararlas (ADR-0018).
+#
+# REDES: tres subredes privadas, como en una VPC (ADR-0023). Docker aísla por
+# defecto: dos contenedores sin una red en común no se ven. Conectar un
+# servicio a dos redes es el equivalente de una regla de security group que
+# permite ese tráfico. Flujos permitidos (se traducen 1 a 1 a AWS):
+#
+#   origen                       → destino         puerto   para qué
+#   fraud-engine                 → redis            6379    estado de detección
+#   fraud-engine                 → settlement       50052   liquidar
+#   fraud-engine, settlement     → kafka            29092   publicar eventos
+#   eventos-*                    → kafka            29092   consumir eventos
+#   eventos-estadisticas         → redis            6379    estadísticas en sombra
+#   settlement, cargar-stats     → redis            6379    registros, estadísticas
+#   loadgen                      → fraud-engine     50051   carga
+#   prometheus                   → servicios        211x    /metrics
+#   grafana                      → prometheus       9090    consultas
+#   kafka-topics                 → kafka            29092   crear topics
+#
+# Lo que NO puede pasar (y Docker lo impide): Grafana no ve Redis ni Kafka, el
+# loadgen no ve Redis, Prometheus no ve los datos.
 name: drts
+
+networks:
+  datos: {}          # Redis, Kafka: la subred privada de datos
+  aplicacion: {}     # servicios del sistema y el generador de carga
+  observabilidad: {} # Prometheus, Grafana
 
 # Las mismas imágenes en todos los entornos: se construyen desde el mismo
 # Dockerfile, eligiendo la etapa final con target.
@@ -33,6 +58,7 @@ services:
   redis:
     logging: *logging
     profiles: [sistema]
+    networks: [datos]
     image: redis:8.10.2
     # Sin snapshots a disco: un snapshot hace fork() del proceso, que puede
     # frenar a Redis justo en medio de una medición. Los datos se recargan
@@ -50,6 +76,7 @@ services:
   cargar-stats:
     logging: *logging
     profiles: [sistema]
+    networks: [datos]
     build: { <<: *build, target: cargar-stats }
     image: drts/cargar-stats:dev
     command: ["-csv", "/app/data/fraudTrain.csv", "-redis", "redis:6379"]
@@ -61,10 +88,12 @@ services:
   settlement:
     logging: *logging
     profiles: [sistema]
+    networks: [aplicacion, datos]
     build: { <<: *build, target: settlement }
     image: drts/settlement:dev
     environment:
       REDIS_ADDR: redis:6379
+      KAFKA_BROKERS: kafka:29092 # listener INTERNO (ver el servicio kafka)
       LOG_NIVEL: info # debug: una línea por transacción (mucho volumen)
     healthcheck:
       # No hay shell en la imagen: el chequeo es el binario /salud (gRPC).
@@ -79,11 +108,13 @@ services:
   fraud-engine:
     logging: *logging
     profiles: [sistema]
+    networks: [aplicacion, datos]
     build: { <<: *build, target: fraud-engine }
     image: drts/fraud-engine:dev
     environment:
       REDIS_ADDR: redis:6379
       SETTLEMENT_ADDR: settlement:50052
+      KAFKA_BROKERS: kafka:29092
       LOG_NIVEL: info # debug: una línea por transacción (mucho volumen)
       # ITERACIONES_SCORING: 10000000   # perilla de costo (default)
     healthcheck:
@@ -96,14 +127,125 @@ services:
       settlement: { condition: service_healthy }
       # Sin estadísticas, toda transacción es "categoría desconocida".
       cargar-stats: { condition: service_completed_successfully }
+      # A propósito NO depende de kafka: el camino de decisión no puede
+      # depender del cold path (ADR-0019). Si Kafka no está, los eventos se
+      # descartan y se cuentan; las transacciones siguen igual.
     # Sin límites de CPU/memoria por ahora: para comparar contra nativo en
     # igualdad de condiciones. Los límites (y el throttling que generan) se
     # estudian en la calibración por entorno (ADR-0018).
+
+  # Kafka: columna de eventos, al costado del camino de decisión (ADR-0019).
+  # Un nodo KRaft combinado (broker + controller): KRaft es cómo Kafka
+  # coordina su propio clúster sin ZooKeeper. En producción serían 3
+  # controllers y 3+ brokers repartidos en zonas; para estudiar alcanza uno.
+  # Perfil "kafka" solo, para el entorno nativo y los tests: make kafka-up.
+  kafka:
+    logging: *logging
+    profiles: [sistema, kafka]
+    image: apache/kafka:4.3.1
+    networks: [datos]
+    ports:
+      - "127.0.0.1:9092:9092" # listener EXTERNO, para el entorno nativo y los tests
+    environment:
+      CLUSTER_ID: S-4cvdehRVSIGIbYBnJv3g # identificador del clúster KRaft
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      # DOS listeners de clientes, por la trampa de "advertised listeners":
+      # el broker le dice a cada cliente a qué dirección conectarse después
+      # del primer contacto. Desde adentro del Compose es kafka:29092; desde
+      # el host, localhost:9092. Con uno solo, alguno de los dos lados no
+      # llega. (En la nube pasa lo mismo: la dirección anunciada tiene que
+      # ser alcanzable desde las otras instancias.)
+      KAFKA_LISTENERS: INTERNO://:29092,EXTERNO://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNO://kafka:29092,EXTERNO://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNO:PLAINTEXT,EXTERNO:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNO
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      # Un solo broker: los topics internos no pueden tener más réplicas.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # Los topics se crean a propósito (kafka-topics), no al primer uso: un
+      # typo en un nombre crearía un topic nuevo en silencio.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Memoria acotada: pensando en instancias chicas en la nube.
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx512m"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 15s
+
+  # Corre una vez y termina: crea los topics.
+  # 3 particiones: hasta 3 consumidores de un mismo grupo en paralelo (punto
+  # de partida). Retención 7 días: margen para reprocesar.
+  kafka-topics:
+    logging: *logging
+    profiles: [sistema, kafka]
+    image: apache/kafka:4.3.1
+    networks: [datos]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        for t in drts.transacciones.evaluadas drts.transacciones.liquidadas; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists \
+            --topic "$$t" --partitions 3 --replication-factor 1 --config retention.ms=604800000 || exit 1
+        done
+    depends_on:
+      kafka: { condition: service_healthy }
+
+  # Consumidores del cold path (ADR-0025): un contenedor por rol, cada uno
+  # con su consumer group. Esperan a que existan los topics. Si se caen o se
+  # atrasan, el camino de decisión sigue igual (los eventos esperan en Kafka).
+  eventos-auditoria:
+    logging: *logging
+    profiles: [sistema]
+    build: { <<: *build, target: eventos }
+    image: drts/eventos:dev
+    command: ["-rol", "auditoria", "-dir", "/app/auditoria"]
+    environment: { KAFKA_BROKERS: "kafka:29092" }
+    # Registro durable: un archivo JSONL por día, en ./auditoria (fuera de
+    # git). Corre con tu uid para poder escribir ahí (la imagen es 65532).
+    user: "${DRTS_UID:-1000}:${DRTS_GID:-1000}"
+    volumes:
+      - ./auditoria:/app/auditoria
+    networks: [aplicacion, datos]
+    depends_on:
+      kafka-topics: { condition: service_completed_successfully }
+
+  eventos-alertas:
+    logging: *logging
+    profiles: [sistema]
+    image: drts/eventos:dev
+    pull_policy: never # la imagen la construye eventos-auditoria; no buscarla en Docker Hub
+    command: ["-rol", "alertas"]
+    environment: { KAFKA_BROKERS: "kafka:29092" }
+    networks: [aplicacion, datos]
+    depends_on:
+      kafka-topics: { condition: service_completed_successfully }
+      eventos-auditoria: { condition: service_started } # la imagen la construye auditoria
+
+  eventos-estadisticas:
+    logging: *logging
+    profiles: [sistema]
+    image: drts/eventos:dev
+    pull_policy: never # la imagen la construye eventos-auditoria; no buscarla en Docker Hub
+    command: ["-rol", "estadisticas"]
+    environment: { KAFKA_BROKERS: "kafka:29092", REDIS_ADDR: "redis:6379" }
+    networks: [aplicacion, datos]
+    depends_on:
+      kafka-topics: { condition: service_completed_successfully }
+      cargar-stats: { condition: service_completed_successfully } # la línea base
+      eventos-auditoria: { condition: service_started }
 
   # ------------------------------------------------------------------ carga
   loadgen:
     logging: *logging
     profiles: [carga]
+    networks: [aplicacion]
     build: { <<: *build, target: loadgen }
     image: drts/loadgen:dev
     # El target va fijo en el entrypoint; los argumentos de "run" reemplazan
@@ -122,6 +264,9 @@ services:
   # --------------------------------------------------------- observabilidad
   prometheus:
     logging: *logging
+    # observabilidad (Grafana lo consulta) + aplicacion (scrapea los servicios).
+    # No está en "datos": no tiene nada que hacer con Redis ni Kafka.
+    networks: [observabilidad, aplicacion]
     image: prom/prometheus:v3.15.0 # versión fija: el entorno se levanta igual siempre
     command:
       - --config.file=/etc/prometheus/prometheus.yml
@@ -140,6 +285,7 @@ services:
 
   grafana:
     logging: *logging
+    networks: [observabilidad]
     image: grafana/grafana:13.2.3
     environment:
       # Entorno local de estudio: sin login (por eso el puerto va atado a

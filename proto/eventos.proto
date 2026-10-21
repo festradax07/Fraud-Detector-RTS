@@ -1,0 +1,53 @@
+// Eventos del D-RTS: lo que publican los servicios en Kafka, al costado del
+// camino de decisión (ADR-0019). Archivo aparte del contrato gRPC
+// (transactions.proto): los eventos importan sus mensajes, no lo modifican.
+//
+// Reglas de evolución (protobuf): nunca reusar ni cambiar el número de un
+// campo; agregar campos nuevos con números nuevos. Un consumidor viejo
+// ignora los campos que no conoce, y uno nuevo ve los que faltan en su valor
+// cero. Para un cambio incompatible, subir "version".
+syntax = "proto3";
+package transactions;
+option go_package = "fd_rts/proto/transactions_pb";
+
+import "proto/transactions.proto";
+
+// TransaccionEvaluada: el Fraud-Engine respondió una transacción.
+// Topic drts.transacciones.evaluadas, clave = card_token (orden por tarjeta).
+//
+// Se publica cuando hubo una decisión, y también cuando Settlement no
+// confirmó (resultado ambiguo): la auditoría lo necesita para cruzarlo con lo
+// que Settlement registró. No se publica para requests inválidas ni early
+// drops: eso lo cuentan las métricas.
+message TransaccionEvaluada {
+  int32 version = 1;
+  string tx_id = 2;
+  string card_token = 3; // token, no el número de tarjeta
+  string user_id = 4;
+  double amount = 5;
+  string merchant_category = 6;
+
+  // Lo que el motor respondió, si hubo decisión. Vacío si no hubo.
+  EvaluationResponse evaluacion = 7;
+  // Si no hubo decisión: el motivo del error (ErrorInfo.Reason), por
+  // ejemplo SETTLEMENT_TIMEOUT. Vacío si hubo decisión.
+  string error_motivo = 8;
+
+  int64 evaluado_ns = 9;        // cuándo respondió el motor (Unix, ns)
+  int64 drem_llegada_us = 10;   // D_rem al llegar (µs)
+  int64 slack_us = 11;          // slack al decidir la opcional (µs; puede ser negativo)
+}
+
+// TransaccionLiquidada: Settlement registró el resultado de una transacción.
+// Topic drts.transacciones.liquidadas, clave = tx_id.
+message TransaccionLiquidada {
+  int32 version = 1;
+  string tx_id = 2;
+  string user_id = 3;
+  double amount = 4;
+  // Lo que quedó registrado (en un reintento, el primer resultado final).
+  TxStatus estado = 5;
+  string rejection_reason = 6;
+  int64 latencia_e2e_us = 7;    // desde la emisión en el cliente (µs)
+  int64 registrado_ns = 8;      // cuándo se registró (Unix, ns)
+}

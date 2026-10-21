@@ -1,6 +1,6 @@
 # ADR-0019: Kafka como columna de eventos, fuera del camino de decisión
 
-- **Estado:** Aceptada (pendiente de implementación)
+- **Estado:** Aceptada (implementada: ADR-0023, ADR-0024, ADR-0025)
 - **Fecha:** 2026-10-19
 - **Etapa:** 8 (pasa a ser parte del núcleo)
 

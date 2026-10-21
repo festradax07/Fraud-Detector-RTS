@@ -1,6 +1,10 @@
+# Binarios que deja `go build ./cmd/<x>` en la raíz
 /server
 /settlement
 /loadgen
+/eventos
+/cargar-stats
+/salud
 *.exe
 
 # Documentos privados (guía, roadmap). Los ADRs (docs/adr/) son públicos.
@@ -13,3 +17,6 @@
 
 # Resultados de corridas del load-generator
 /resultados/
+
+# Registro de auditoría (archivos JSONL que escribe eventos -rol auditoria)
+/auditoria/

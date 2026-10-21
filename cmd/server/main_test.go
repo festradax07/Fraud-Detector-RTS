@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
@@ -19,7 +20,9 @@ import (
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
+	"fd_rts/internal/eventos"
 	"fd_rts/internal/fallas"
 	"fd_rts/internal/mandatoria"
 	"fd_rts/internal/metricas"
@@ -107,7 +110,7 @@ func nuevoServerConRedis(t *testing.T) (*fraudEngineServer, *redis.Client, strin
 	}
 	return &fraudEngineServer{
 		verificador: v,
-		settle:      levantarSettlement(t, settlement.NuevoServidor(rdb, prefijo)),
+		settle:      levantarSettlement(t, settlement.NuevoServidor(rdb, prefijo, nil, 0)),
 		iteraciones: iteracionesPorDefecto,
 	}, rdb, prefijo
 }
@@ -453,7 +456,7 @@ func TestSettlementFalla(t *testing.T) {
 		// mucho antes que el deadline del cliente.
 		{"Settlement lento", func(t *testing.T, s *fraudEngineServer) pb.SettlementClient {
 			rdb, prefijo := pruebas.Redis(t) // prefijo único, se limpia al terminar
-			return levantarSettlement(t, settlementLento{settlement.NuevoServidor(rdb, prefijo), 100 * time.Millisecond})
+			return levantarSettlement(t, settlementLento{settlement.NuevoServidor(rdb, prefijo, nil, 0), 100 * time.Millisecond})
 		}, codes.DeadlineExceeded, presupuesto.ReservaSettleNet + 10*time.Millisecond},
 	}
 	for _, c := range casos {
@@ -518,7 +521,7 @@ func (s settlementRespuestaPerdida) CommitTransaction(ctx context.Context, req *
 func TestAmbiguedadDelTimeout(t *testing.T) {
 	s, rdb, prefijo := nuevoServerConRedis(t)
 	normal := s.settle
-	s.settle = levantarSettlement(t, settlementRespuestaPerdida{settlement.NuevoServidor(rdb, prefijo), 30 * time.Millisecond})
+	s.settle = levantarSettlement(t, settlementRespuestaPerdida{settlement.NuevoServidor(rdb, prefijo, nil, 0), 30 * time.Millisecond})
 
 	// 1. Primer intento: el motor vence esperando la respuesta → error...
 	_, err := evaluar(t, s, txValida("t1", "tok-ok", baLat, baLon))
@@ -569,7 +572,7 @@ func TestMotivosDeError(t *testing.T) {
 		// Mismo código que el early drop, otro motivo: este es AMBIGUO.
 		{"settlement lento", func(t *testing.T, s *fraudEngineServer) {
 			rdb, prefijo := pruebas.Redis(t) // prefijo único, se limpia al terminar
-			s.settle = levantarSettlement(t, settlementLento{settlement.NuevoServidor(rdb, prefijo), 100 * time.Millisecond})
+			s.settle = levantarSettlement(t, settlementLento{settlement.NuevoServidor(rdb, prefijo, nil, 0), 100 * time.Millisecond})
 		}, txValida("t1", "tok-ok", baLat, baLon), 90 * time.Millisecond, codes.DeadlineExceeded, fallas.SettlementTimeout},
 	}
 	for _, c := range casos {
@@ -685,5 +688,112 @@ func TestValidar(t *testing.T) {
 				t.Errorf("código=%v motivo=%q, se esperaba InvalidArgument / %s", status.Code(err), fallas.Motivo(err), fallas.RequestInvalida)
 			}
 		})
+	}
+}
+
+// Eventos de punta a punta, con Kafka real: el motor publica lo que
+// respondió y Settlement lo que registró. Incluye la ambigua comprometida
+// (ADR-0013): el cliente recibe SETTLEMENT_TIMEOUT pero Settlement registró
+// COMMITTED. Los dos eventos tienen que llegar para que la auditoría pueda
+// cruzarlos.
+func TestEventosDePuntaAPunta(t *testing.T) {
+	brokers, topics := pruebas.Kafka(t, "evaluadas", "liquidadas")
+	tps := eventos.Topics{Evaluadas: topics[0], Liquidadas: topics[1]}
+	prodMotor, err := eventos.NuevoProductor(brokers, tps, prometheus.NewRegistry())
+	if err != nil {
+		t.Fatalf("productor: %v", err)
+	}
+	prodSettle, err := eventos.NuevoProductor(brokers, tps, prometheus.NewRegistry())
+	if err != nil {
+		t.Fatalf("productor: %v", err)
+	}
+
+	s, rdb, prefijo := nuevoServerConRedis(t)
+	s.eventos = prodMotor
+	normal := levantarSettlement(t, settlement.NuevoServidor(rdb, prefijo, prodSettle, 0))
+	s.settle = normal
+
+	evaluar(t, s, txValida("aprobada", "tok-a", baLat, baLon))
+	evaluar(t, s, txValida("fraude", "tok-robada", baLat, baLon))
+	// Settlement que compromete y "pierde" la respuesta: ambigua.
+	s.settle = levantarSettlement(t, settlementRespuestaPerdida{settlement.NuevoServidor(rdb, prefijo, prodSettle, 0), 30 * time.Millisecond})
+	if _, err := evaluar(t, s, txValida("ambigua", "tok-b", baLat, baLon)); fallas.Motivo(err) != fallas.SettlementTimeout {
+		t.Fatalf("ambigua: motivo %q, se esperaba SETTLEMENT_TIMEOUT", fallas.Motivo(err))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	prodMotor.Cerrar(ctx)
+	prodSettle.Cerrar(ctx)
+
+	evaluadas := map[string]*pb.TransaccionEvaluada{}
+	for _, r := range pruebas.LeerKafka(t, brokers, topics[0], 3) {
+		var ev pb.TransaccionEvaluada
+		if err := proto.Unmarshal(r.Value, &ev); err != nil {
+			t.Fatalf("decodificar: %v", err)
+		}
+		evaluadas[ev.TxId] = &ev
+	}
+	if ev := evaluadas["aprobada"]; ev == nil || ev.Evaluacion.GetIsFraud() || ev.ErrorMotivo != "" {
+		t.Errorf("aprobada: %+v", ev)
+	} else if ev.DremLlegadaUs < 150_000 || ev.SlackUs <= 0 {
+		// Llegó con ~200ms y hubo slack (corrió la opcional).
+		t.Errorf("aprobada: D_rem=%dµs slack=%dµs", ev.DremLlegadaUs, ev.SlackUs)
+	}
+	if ev := evaluadas["fraude"]; ev == nil || ev.Evaluacion.GetRejectionReason() != mandatoria.MotivoBlacklist {
+		t.Errorf("fraude: %+v", ev)
+	}
+	// Sin decisión respondida: evaluación vacía y el motivo del error.
+	if ev := evaluadas["ambigua"]; ev == nil || ev.Evaluacion != nil || ev.ErrorMotivo != fallas.SettlementTimeout {
+		t.Errorf("ambigua: %+v", ev)
+	}
+
+	liquidadas := map[string]pb.TxStatus{}
+	for _, r := range pruebas.LeerKafka(t, brokers, topics[1], 3) {
+		var ev pb.TransaccionLiquidada
+		if err := proto.Unmarshal(r.Value, &ev); err != nil {
+			t.Fatalf("decodificar: %v", err)
+		}
+		liquidadas[ev.TxId] = ev.Estado
+	}
+	want := map[string]pb.TxStatus{
+		"aprobada": pb.TxStatus_STATUS_COMMITTED,
+		"fraude":   pb.TxStatus_STATUS_REJECTED_FRAUD,
+		// El cliente recibió error, pero quedó comprometida: lo que la
+		// auditoría tiene que detectar.
+		"ambigua": pb.TxStatus_STATUS_COMMITTED,
+	}
+	for tx, estado := range want {
+		if liquidadas[tx] != estado {
+			t.Errorf("liquidada %s: %v, se esperaba %v", tx, liquidadas[tx], estado)
+		}
+	}
+}
+
+// Con Kafka caído, las decisiones y su latencia no cambian: el cold path no
+// toca el camino de decisión (ADR-0019).
+func TestKafkaCaidoNoAfectaDecisiones(t *testing.T) {
+	prod, err := eventos.NuevoProductor([]string{"localhost:1"}, eventos.TopicsPorDefecto, prometheus.NewRegistry())
+	if err != nil {
+		t.Fatalf("productor: %v", err)
+	}
+	s := nuevoServerDePrueba(t)
+	s.eventos = prod
+
+	inicio := time.Now()
+	r1, err1 := evaluar(t, s, txValida("t1", "tok-a", baLat, baLon))
+	r2, err2 := evaluar(t, s, txValida("t2", "tok-robada", baLat, baLon))
+	tardo := time.Since(inicio)
+
+	if err1 != nil || r1.IsFraud {
+		t.Errorf("aprobada: resp=%+v err=%v", r1, err1)
+	}
+	if err2 != nil || r2.RejectionReason != mandatoria.MotivoBlacklist {
+		t.Errorf("fraude: resp=%+v err=%v", r2, err2)
+	}
+	// Dos transacciones: ~16ms de scoring la aprobada + la mandatoria.
+	// Si publicar esperara a Kafka, se iría a cientos de ms o al deadline.
+	if tardo > 100*time.Millisecond {
+		t.Errorf("tardaron %v con Kafka caído: el cold path está frenando el camino de decisión", tardo)
 	}
 }

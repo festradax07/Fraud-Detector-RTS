@@ -29,7 +29,7 @@ type entorno struct {
 // TCP real, con un cliente gRPC real apuntándole (internal/pruebas).
 func levantarSettlement(t *testing.T, rdb *redis.Client, prefijo string) *entorno {
 	t.Helper()
-	srv := NuevoServidor(rdb, prefijo)
+	srv := NuevoServidor(rdb, prefijo, nil, 0)
 	conn := pruebas.ServirGRPC(t, func(g *grpc.Server) { pb.RegisterSettlementServer(g, srv) })
 	return &entorno{cliente: pb.NewSettlementClient(conn), srv: srv}
 }
@@ -245,5 +245,22 @@ func TestReintentoNoPisaElResultado(t *testing.T) {
 				t.Errorf("en Redis: %q, se esperaba %q", guardado, c.wantEstado.String())
 			}
 		})
+	}
+}
+
+// Con TTL, el registro vence solo; el reintento dentro del TTL sigue viendo
+// el primer resultado final.
+func TestRegistroConTTL(t *testing.T) {
+	rdb, prefijo := pruebas.Redis(t)
+	srv := NuevoServidor(rdb, prefijo, nil, 24*time.Hour)
+	conn := pruebas.ServirGRPC(t, func(g *grpc.Server) { pb.RegisterSettlementServer(g, srv) })
+	e := &entorno{cliente: pb.NewSettlementClient(conn), srv: srv}
+
+	if _, _, err := e.commit(t, reqSettle("t1", false, 0)); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	ttl, err := rdb.TTL(context.Background(), srv.ClaveRegistro("t1")).Result()
+	if err != nil || ttl <= 23*time.Hour || ttl > 24*time.Hour {
+		t.Errorf("TTL = %v (err=%v), se esperaba ~24h", ttl, err)
 	}
 }
