@@ -1,0 +1,25 @@
+# Perfil de un día hábil (ADR-0026). Tasa = fracción × pico (-rps).
+#
+# Forma ILUSTRATIVA, no medida: sigue lo esperable en pagos con tarjeta
+# (madrugada baja, carga estable a la mañana, pico al mediodía, pico máximo
+# a la tarde-noche). El dataset Sparkov no sirve para esto: su distribución
+# por hora es un escalón (~63% de 0 a 11h, ~98% de 12 a 23h).
+#
+# Entre puntos se interpola linealmente; dos puntos con la misma hora forman
+# un escalón.
+hora,fraccion
+0,0.15
+3,0.08
+6,0.12
+7,0.25
+9,0.50
+11,0.50
+12,0.85
+13,0.85
+14,0.60
+16,0.55
+18,0.80
+19,1.00
+20,0.80
+22,0.40
+24,0.15

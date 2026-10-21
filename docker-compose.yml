@@ -257,6 +257,7 @@ services:
     user: "${DRTS_UID:-1000}:${DRTS_GID:-1000}"
     volumes:
       - ./data:/app/data:ro
+      - ./perfiles:/app/perfiles:ro # curvas de carga del día (-perfil, ADR-0026)
       - ./resultados:/app/resultados
     depends_on:
       fraud-engine: { condition: service_healthy }

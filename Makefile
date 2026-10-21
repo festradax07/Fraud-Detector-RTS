@@ -56,7 +56,7 @@ imagenes:
 # --use-aliases: sin esto, el contenedor de "run" no tiene el nombre
 # "loadgen" en la red y Prometheus no lo encuentra.
 # Ejemplo: make carga-compose ARGS="-rps 700 -duracion 30s"
-ARGS ?= -modo nominal
+carga-compose: ARGS ?= -modo nominal
 carga-compose:
 	docker compose --profile sistema --profile carga run --rm --use-aliases loadgen $(ARGS)
 

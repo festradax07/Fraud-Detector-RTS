@@ -3,6 +3,7 @@
 //
 //	go run ./cmd/loadgen -modo nominal               # 50 RPS, 30s
 //	go run ./cmd/loadgen -modo sobrecarga -duracion 60s
+//	go run ./cmd/loadgen -perfil perfiles/dia-habil.csv -rps 800   # un día en 24 min
 //
 // Diseño (ADR-0014):
 //   - LAZO ABIERTO: las llegadas siguen un proceso de Poisson y cada una sale
@@ -89,6 +90,8 @@ type resultado struct {
 	// Reintentos (solo para ambiguas).
 	intentos   int
 	resolucion string // categoría del último intento
+
+	hora float64 // hora del día del perfil en que llegó (solo con -perfil)
 }
 
 // clasificar decide la categoría de una respuesta a partir del error. Es una
@@ -250,8 +253,12 @@ func (g *generador) enviar(i int, f fila, programada time.Time) resultado {
 
 func main() {
 	modo := flag.String("modo", "nominal", "nominal (50 RPS) o sobrecarga (350 RPS)")
-	rpsFlag := flag.Float64("rps", 0, "tasa de llegadas; si es 0 se usa la del modo")
-	duracion := flag.Duration("duracion", 30*time.Second, "cuánto tiempo generar llegadas")
+	rpsFlag := flag.Float64("rps", 0, "tasa de llegadas (con -perfil: la del pico); si es 0 se usa la del modo")
+	duracion := flag.Duration("duracion", 30*time.Second, "cuánto tiempo generar llegadas (con -perfil sale de -desde, -hasta y -compresion)")
+	rutaPerfil := flag.String("perfil", "", "CSV hora,fraccion con la curva del día (ADR-0026); vacío: tasa constante")
+	compresion := flag.Float64("compresion", 60, "con -perfil: cuántas horas del perfil por hora real (60: 1 hora = 1 minuto)")
+	desde := flag.Float64("desde", -1, "con -perfil: hora del día en que arranca (default: el primer punto)")
+	hasta := flag.Float64("hasta", -1, "con -perfil: hora del día en que termina (default: el último punto)")
 	deadline := flag.Duration("deadline", 200*time.Millisecond, "deadline de cada transacción")
 	rutaCSV := flag.String("csv", "data/fraudTest.csv", "dataset de donde salen las transacciones")
 	target := flag.String("target", "localhost:50051", "dirección del Fraud-Engine")
@@ -271,6 +278,34 @@ func main() {
 		if rps, ok = modos[*modo]; !ok {
 			registro.Fatal("modo desconocido (nominal o sobrecarga)", "modo", *modo)
 		}
+	}
+	titulo := fmt.Sprintf("%s: %.0f RPS pedidos", *modo, rps)
+
+	// Con perfil, la tasa sigue la curva del día: horaEn traduce el tiempo
+	// de la corrida a la hora del perfil, y fraccionEn da qué parte del pico
+	// toca en cada instante. Sin perfil, las dos quedan en nil (tasa fija).
+	var horaEn, fraccionEn func(time.Duration) float64
+	if *rutaPerfil != "" {
+		p, err := leerPerfil(*rutaPerfil)
+		if err != nil {
+			registro.Fatal("perfil inválido", "perfil", *rutaPerfil, "error", err)
+		}
+		if *desde < 0 {
+			*desde = p[0].hora
+		}
+		if *hasta < 0 {
+			*hasta = p[len(p)-1].hora
+		}
+		if *compresion <= 0 || *desde >= *hasta || *hasta > 24 {
+			registro.Fatal("con -perfil: -compresion > 0 y 0 <= -desde < -hasta <= 24",
+				"compresion", *compresion, "desde", *desde, "hasta", *hasta)
+		}
+		*duracion = time.Duration((*hasta - *desde) / *compresion * float64(time.Hour))
+		horaEn = func(t time.Duration) float64 { return *desde + t.Hours()**compresion }
+		fraccionEn = func(t time.Duration) float64 { return p.fraccion(horaEn(t)) }
+
+		*modo = "perfil-" + strings.TrimSuffix(filepath.Base(*rutaPerfil), filepath.Ext(*rutaPerfil))
+		titulo = fmt.Sprintf("%s: pico %.0f RPS, %s a %s (×%.0f)", *modo, rps, formatoHora(*desde), formatoHora(*hasta), *compresion)
 	}
 
 	filas, err := leerFilas(*rutaCSV)
@@ -301,7 +336,7 @@ func main() {
 	}
 	calentar(g.cliente)
 
-	slog.Info("corrida", "id", g.corrida, "rps", rps, "duracion", *duracion, "deadline", *deadline, "filas", len(filas))
+	slog.Info("corrida", "id", g.corrida, "rps", rps, "duracion", *duracion, "deadline", *deadline, "filas", len(filas), "perfil", *rutaPerfil)
 
 	// Los resultados llegan por un channel a UNA goroutine que los junta:
 	// así nadie más toca el slice y no hace falta mutex ("compartir memoria
@@ -323,22 +358,31 @@ func main() {
 	// este loop. Con semilla fija, la secuencia de llegadas es reproducible.
 	r := rand.New(rand.NewPCG(*semilla, *semilla))
 	inicio = time.Now()
-	proxima := inicio
+	var t time.Duration // instante de la llegada, contado desde el inicio
 	for i := 0; ; i++ {
-		// Reloj ABSOLUTO: próxima = anterior + intervalo. Si en cambio se
-		// durmiera "intervalo" después de lanzar, el tiempo de lanzar se iría
-		// sumando y la tasa real quedaría por debajo de la pedida.
-		proxima = proxima.Add(intervaloPoisson(r, rps))
-		if proxima.Sub(inicio) >= *duracion {
+		// Reloj ABSOLUTO: cada llegada se calcula desde la anterior, no desde
+		// "ahora". Si en cambio se durmiera "intervalo" después de lanzar, el
+		// tiempo de lanzar se iría sumando y la tasa real quedaría por debajo
+		// de la pedida.
+		t = sortearLlegada(r, t, *duracion, rps, fraccionEn)
+		if t >= *duracion {
 			break
 		}
+		proxima := inicio.Add(t)
 		time.Sleep(time.Until(proxima)) // si ya pasó, no duerme
 
+		var hora float64
+		if fraccionEn != nil {
+			hora = horaEn(t)
+			met.rpsObjetivo.Set(rps * fraccionEn(t)) // Grafana dibuja la curva del día
+		}
 		met.ofrecidas.Inc()
 		wg.Add(1)
 		go func(i int, f fila, programada time.Time) {
 			defer wg.Done()
-			resultados <- g.enviar(i, f, programada)
+			res := g.enviar(i, f, programada)
+			res.hora = hora
+			resultados <- res
 		}(i, filas[i%len(filas)], proxima)
 	}
 	generacion := time.Since(inicio)
@@ -348,12 +392,15 @@ func main() {
 	<-listo
 
 	sort.Slice(todos, func(a, b int) bool { return todos[a].i < todos[b].i })
-	reportar(todos, *modo, rps, generacion, *deadline)
+	reportar(todos, titulo, generacion, *deadline)
+	if horaEn != nil {
+		reportarFranjas(todos, *desde, *hasta, *compresion, *deadline)
+	}
 
 	if *salida == "" {
 		*salida = filepath.Join("resultados", fmt.Sprintf("loadgen-%s-%s.csv", *modo, inicio.Format("20060102-150405")))
 	}
-	if err := escribirCSV(*salida, todos); err != nil {
+	if err := escribirCSV(*salida, todos, horaEn != nil); err != nil {
 		registro.Fatal("no se pudo escribir el CSV de resultados", "salida", *salida, "error", err)
 	}
 	slog.Info("resultados por transacción", "csv", *salida)
@@ -374,10 +421,14 @@ func calentar(c pb.FraudEngineClient) {
 	c.EvaluateTransaction(ctx, &pb.TransactionRequest{}) // InvalidArgument: solo abre la conexión
 }
 
-func reportar(todos []resultado, modo string, rps float64, generacion, deadline time.Duration) {
+func reportar(todos []resultado, titulo string, generacion, deadline time.Duration) {
 	n := len(todos)
-	fmt.Printf("\n=== %s: %.0f RPS pedidos, %d transacciones en %v → %.1f RPS logrados ===\n",
-		modo, rps, n, generacion.Round(time.Millisecond), float64(n)/generacion.Seconds())
+	if n == 0 {
+		fmt.Printf("\n=== %s: no hubo llegadas ===\n", titulo)
+		return
+	}
+	fmt.Printf("\n=== %s, %d transacciones en %v → %.1f RPS logrados ===\n",
+		titulo, n, generacion.Round(time.Millisecond), float64(n)/generacion.Seconds())
 
 	// ¿Pudo el generador seguir el ritmo? Si no, la corrida no es válida.
 	var retrasos []time.Duration
@@ -459,7 +510,55 @@ func reportar(todos []resultado, modo string, rps float64, generacion, deadline 
 	}
 }
 
-func escribirCSV(ruta string, todos []resultado) error {
+// reportarFranjas resume la corrida hora por hora del perfil. El resumen
+// global promedia el día entero y esconde el pico; en tiempo real duro lo que
+// importa es cómo le fue justamente en el pico.
+func reportarFranjas(todos []resultado, desde, hasta, compresion float64, deadline time.Duration) {
+	type franja struct {
+		lat                 []time.Duration
+		aTiempo, degradadas int
+	}
+	franjas := map[int]*franja{}
+	for _, r := range todos {
+		h := int(r.hora)
+		if franjas[h] == nil {
+			franjas[h] = &franja{}
+		}
+		f := franjas[h]
+		f.lat = append(f.lat, r.latencia)
+		if r.latencia <= deadline {
+			f.aTiempo++
+		}
+		if r.degradada {
+			f.degradadas++
+		}
+	}
+
+	fmt.Printf("\npor franja horaria del perfil (1 hora del perfil = %v reales):\n", time.Duration(float64(time.Hour)/compresion).Round(time.Second))
+	fmt.Printf("%-7s %8s %8s %10s %10s %11s\n", "franja", "n", "RPS", "% a tiempo", "P99", "degradadas")
+	for h := int(desde); float64(h) < hasta; h++ {
+		f := franjas[h]
+		if f == nil {
+			fmt.Printf("%-7s %8d\n", formatoHora(float64(h)), 0)
+			continue
+		}
+		// La primera y la última franja pueden ser parciales (-desde 9.5).
+		horas := math.Min(float64(h+1), hasta) - math.Max(float64(h), desde)
+		segundos := horas * 3600 / compresion
+		sort.Slice(f.lat, func(a, b int) bool { return f.lat[a] < f.lat[b] })
+		n := len(f.lat)
+		fmt.Printf("%-7s %8d %8.0f %9.2f%% %10v %11d\n", formatoHora(float64(h)), n, float64(n)/segundos,
+			100*float64(f.aTiempo)/float64(n), percentil(f.lat, .99).Round(time.Millisecond), f.degradadas)
+	}
+}
+
+// formatoHora: 9.5 → "09:30".
+func formatoHora(h float64) string {
+	minutos := int(math.Round(h * 60))
+	return fmt.Sprintf("%02d:%02d", minutos/60, minutos%60)
+}
+
+func escribirCSV(ruta string, todos []resultado, conPerfil bool) error {
 	if err := os.MkdirAll(filepath.Dir(ruta), 0o755); err != nil {
 		return err
 	}
@@ -470,8 +569,12 @@ func escribirCSV(ruta string, todos []resultado) error {
 	defer f.Close()
 	w := csv.NewWriter(f)
 	w.Write([]string{"i", "programada_ns", "retraso_us", "latencia_us", "categoria", "motivo",
-		"is_fraud", "rejection_reason", "is_degraded", "intentos", "resolucion"})
+		"is_fraud", "rejection_reason", "is_degraded", "intentos", "resolucion", "hora_perfil"})
 	for _, r := range todos {
+		hora := "" // vacía si la corrida fue a tasa constante
+		if conPerfil {
+			hora = strconv.FormatFloat(r.hora, 'f', 4, 64)
+		}
 		w.Write([]string{
 			strconv.Itoa(r.i),
 			strconv.FormatInt(r.programada.UnixNano(), 10),
@@ -479,7 +582,7 @@ func escribirCSV(ruta string, todos []resultado) error {
 			strconv.FormatInt(r.latencia.Microseconds(), 10),
 			r.cat, r.motivo,
 			strconv.FormatBool(r.fraude), r.rechazo, strconv.FormatBool(r.degradada),
-			strconv.Itoa(r.intentos), r.resolucion,
+			strconv.Itoa(r.intentos), r.resolucion, hora,
 		})
 	}
 	w.Flush() // csv.Writer tiene buffer: sin Flush, lo último no se escribe

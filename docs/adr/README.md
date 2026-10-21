@@ -44,6 +44,7 @@ escriben: [ADR-0001](0001-registrar-decisiones-con-adrs.md) y la
 | [0023](0023-redes-como-subredes-privadas.md) | Redes del Compose como subredes privadas; Kafka como unidad aparte | Aceptada | 8 (Kafka) |
 | [0024](0024-eventos-en-protobuf-sin-bloquear.md) | Eventos en protobuf, publicados sin bloquear | Aceptada | 8 (Kafka) |
 | [0025](0025-consumidores-y-auditoria.md) | Consumidores del cold path; la auditoría cruza los dos lados | Aceptada | 8 (Kafka) |
+| [0026](0026-perfil-de-carga-diario.md) | Perfil de carga diario (Poisson no homogéneo) | Aceptada | 6 (extiende el load generator) |
 
 ## Cómo leerlos
 
@@ -53,6 +54,6 @@ escriben: [ADR-0001](0001-registrar-decisiones-con-adrs.md) y la
   0012 (Settlement), 0013 (ambigüedad del timeout e idempotencia), 0022 (conexión caída).
 - **Detección:** 0006 (qué se registra), 0007 (validación), 0008 (Redis),
   0010 (scoring).
-- **Medir y operar:** 0014 (load generator), 0015 (observabilidad), 0016
+- **Medir y operar:** 0014 (load generator), 0026 (perfil de carga diario), 0015 (observabilidad), 0016
   (tests reales), 0017 (configuración y apagado), 0018 (entornos), 0019
   (Kafka), 0020 (imágenes, salud y Compose), 0021 (logs), 0023 (redes), 0024 (eventos), 0025 (consumidores y auditoría).

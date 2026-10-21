@@ -234,7 +234,7 @@ timeout esperando a Settlement es "resultado desconocido" y cómo se resuelve:
 |---|---|---|
 | [`server`](cmd/server/main.go) | **Fraud-Engine.** Admisión, validación, fase mandatoria contra Redis, slack, fase opcional y liquidación con Settlement. Puerto gRPC `:50051`, métricas `:2112`. | 0002–0009, 0012, 0013 |
 | [`settlement`](cmd/settlement/main.go) | **Settlement.** Registra cada decisión (`COMMITTED`, `REJECTED_FRAUD`, `ABORTED_TIMEOUT`) de forma idempotente y calcula la latencia de extremo a extremo. Puerto `:50052`, métricas `:2113`. | 0012, 0013 |
-| [`loadgen`](cmd/loadgen/main.go) | **Generador de carga** de lazo abierto (llegadas de Poisson). Mide la latencia desde el instante programado, clasifica resultados y reintenta los ambiguos. Métricas `:2114`. | 0014 |
+| [`loadgen`](cmd/loadgen/main.go) | **Generador de carga** de lazo abierto (llegadas de Poisson). Tasa fija o un **perfil del día** con picos ([`perfiles/`](perfiles/)). Mide la latencia desde el instante programado, clasifica resultados y reintenta los ambiguos. Métricas `:2114`. | 0014, 0026 |
 | [`cargar-stats`](cmd/cargar-stats/main.go) | Calcula media, desvío y peso de riesgo por categoría (algoritmo de Welford) desde el dataset y los guarda en Redis. | 0010 |
 | [`salud`](cmd/salud/main.go) | Chequeo de salud por gRPC para contenedores sin shell. | 0020 |
 | [`eventos`](cmd/eventos/main.go) | **Consumidores del cold path**, un rol por contenedor: `auditoria` (cruza los dos topics y detecta discrepancias), `alertas`, `estadisticas` (modo sombra) y `volcar` (muestra los eventos como JSON). | 0025 |
@@ -282,6 +282,7 @@ solo si cambia un `.proto`.
 │   └── eventos/           consumidores del cold path (un rol por contenedor)
 ├── internal/              toda la lógica (no importable desde afuera del módulo)
 ├── observabilidad/        Prometheus y Grafana, provisionados desde archivos
+├── perfiles/              curvas de carga del día para el loadgen (ADR-0026)
 ├── docs/adr/              decisiones de diseño
 ├── Dockerfile             una imagen por servicio (--target)
 ├── docker-compose.yml     el sistema completo, por perfiles
@@ -394,6 +395,20 @@ make obs-up                                          # Prometheus + Grafana (opc
 
 Cada corrida del generador imprime un resumen (P50/P99/P100 por categoría, %
 dentro del deadline) y deja un CSV por transacción en `resultados/`.
+
+### Un día de carga (perfil con picos)
+
+```sh
+make carga-compose ARGS="-perfil perfiles/dia-habil.csv -rps 800"                # el día entero en 24 min
+make carga-compose ARGS="-perfil perfiles/dia-habil.csv -rps 800 -desde 11 -hasta 14 -compresion 360"  # solo el mediodía, en 30s
+```
+
+La tasa sigue una curva del día (madrugada baja, mañana estable, picos al
+mediodía y a las 19h): un proceso de Poisson no homogéneo
+([ADR-0026](docs/adr/0026-perfil-de-carga-diario.md)). `-rps` es la tasa
+del pico y `-compresion 60` hace que 1 hora del perfil dure 1 minuto. Al
+final se imprime, además, un resumen **por franja horaria**: el pico es lo
+que importa.
 
 ## Configuración
 
