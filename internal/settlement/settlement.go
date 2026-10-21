@@ -70,7 +70,41 @@ type Servidor struct {
 
 // ClaveRegistro es la clave de Redis donde queda el registro de txID.
 func (s *Servidor) ClaveRegistro(txID string) string {
-	return s.prefijo + "settle:" + txID
+	return Clave(s.prefijo, txID)
+}
+
+// Clave es la clave de Redis del registro de txID. El formato vive acá,
+// en el dueño del registro: el Fraud-Engine también la lee (en el viaje 1 a
+// Redis) para responder un reintento con lo que ya quedó registrado
+// (ADR-0027).
+func Clave(prefijo, txID string) string {
+	return prefijo + "settle:" + txID
+}
+
+// Registro es lo que quedó registrado de una transacción con resultado
+// FINAL.
+type Registro struct {
+	Estado    pb.TxStatus // STATUS_COMMITTED o STATUS_REJECTED_FRAUD
+	Motivo    string      // rejection_reason, si fue rechazada
+	Score     float64
+	Degradada bool
+}
+
+// LeerRegistro interpreta el hash que escribe CommitTransaction. ok es false
+// si no hay un resultado FINAL: la clave no existe (map vacío) o el estado
+// es STATUS_ABORTED_TIMEOUT, que un reintento a tiempo puede reemplazar (es
+// la misma regla que registrarUnaVez). Función pura.
+func LeerRegistro(campos map[string]string) (r Registro, ok bool) {
+	r.Estado = pb.TxStatus(pb.TxStatus_value[campos["estado"]])
+	if r.Estado != pb.TxStatus_STATUS_COMMITTED && r.Estado != pb.TxStatus_STATUS_REJECTED_FRAUD {
+		return Registro{}, false
+	}
+	r.Motivo = campos["rejection_reason"]
+	// go-redis guarda los bool como "1"/"0" y los float con strconv: un
+	// campo ilegible queda en su valor cero (el estado es lo que decide).
+	r.Score, _ = strconv.ParseFloat(campos["risk_score"], 64)
+	r.Degradada = campos["is_degraded"] == "1"
+	return r, true
 }
 
 // CommitTransaction registra el resultado de la transacción y devuelve la

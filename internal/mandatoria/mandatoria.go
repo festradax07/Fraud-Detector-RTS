@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"fd_rts/internal/settlement"
 )
 
 // Motivos de rechazo de la fase mandatoria (campo rejection_reason). Son
@@ -85,6 +87,11 @@ type Resultado struct {
 	// la request se degrade: son unos bytes en el mismo viaje, y pedirlo
 	// después costaría un viaje de red entero.
 	StatsCategoria map[string]string
+	// Registro es el hash crudo de lo que Settlement ya registró para este
+	// tx_id (lo interpreta settlement.LeerRegistro). Vacío si no hay nada:
+	// lo normal en un primer intento. En un reintento permite responder lo
+	// registrado sin volver a evaluar (ADR-0027).
+	Registro map[string]string
 }
 
 // Verificador ejecuta la fase mandatoria contra Redis.
@@ -129,6 +136,8 @@ func (v *Verificador) GuardarEstadisticas(ctx context.Context, categoria string,
 //	GET                                        → última posición confiable
 //	HGETALL                                    → estadísticas de la categoría
 //	                                             (para la fase opcional)
+//	HGETALL                                    → lo que Settlement ya registró
+//	                                             para este tx_id (reintentos)
 //
 // Va en un TxPipeline (MULTI/EXEC): un solo viaje como cualquier pipeline,
 // y además atómico, sin comandos de otros clientes intercalados.
@@ -160,6 +169,7 @@ func (v *Verificador) Consultar(ctx context.Context, txID, cardToken, categoria 
 	pipe.Expire(ctx, claveVel, VentanaVelocidad)
 	posGuardada := pipe.Get(ctx, v.clavePosicion(cardToken))
 	stats := pipe.HGetAll(ctx, v.claveStats(categoria))
+	registrado := pipe.HGetAll(ctx, settlement.Clave(v.prefijo, txID))
 
 	// Recién acá viaja todo junto: 1 RTT.
 	//
@@ -173,6 +183,7 @@ func (v *Verificador) Consultar(ctx context.Context, txID, cardToken, categoria 
 		EnBlacklist:    enBlacklist.Val(),
 		Intentos:       intentos.Val(),
 		StatsCategoria: stats.Val(), // HGETALL de una clave inexistente: map vacío
+		Registro:       registrado.Val(),
 	}
 
 	valor, err := posGuardada.Result()

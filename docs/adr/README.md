@@ -30,7 +30,7 @@ escriben: [ADR-0001](0001-registrar-decisiones-con-adrs.md) y la
 | [0009](0009-fail-closed-y-fallo-rapido.md) | Fail-closed y fallo rápido ante fallas de infraestructura | Aceptada | 3 |
 | [0010](0010-modelo-de-scoring.md) | Scoring con Z-score sobre ln(monto), ponderado por categoría | Aceptada | 4 |
 | [0011](0011-costo-simulado-y-wcet.md) | Costo de la fase opcional simulado; presupuestos por peor caso | Aceptada | 4 |
-| [0012](0012-settlement-segundo-servicio-sincronico.md) | Settlement como segundo servicio sincrónico, con timeout propio | Aceptada | 5 |
+| [0012](0012-settlement-segundo-servicio-sincronico.md) | Settlement como segundo servicio sincrónico, con timeout propio | Aceptada (política ante fallas: ver 0027) | 5 |
 | [0013](0013-ambiguedad-del-timeout-e-idempotencia.md) | Ambigüedad del timeout: idempotencia y "el primer resultado final gana" | Aceptada | 5 |
 | [0014](0014-load-generator-de-lazo-abierto.md) | Load generator de lazo abierto | Aceptada | 6 |
 | [0015](0015-observabilidad-prometheus-grafana.md) | Observabilidad con Prometheus y Grafana provisionados | Aceptada | 7 |
@@ -45,13 +45,14 @@ escriben: [ADR-0001](0001-registrar-decisiones-con-adrs.md) y la
 | [0024](0024-eventos-en-protobuf-sin-bloquear.md) | Eventos en protobuf, publicados sin bloquear | Aceptada | 8 (Kafka) |
 | [0025](0025-consumidores-y-auditoria.md) | Consumidores del cold path; la auditoría cruza los dos lados | Aceptada | 8 (Kafka) |
 | [0026](0026-perfil-de-carga-diario.md) | Perfil de carga diario (Poisson no homogéneo) | Aceptada | 6 (extiende el load generator) |
+| [0027](0027-reintento-responde-lo-registrado.md) | Un reintento responde lo registrado; sin registro no hay decisión | Aceptada (reemplaza parte de 0012) | corrección posterior a la 8 |
 
 ## Cómo leerlos
 
 - **Modelo de tiempo real:** 0002 (sincronía y deadline), 0003 (admisión),
   0004 (computación imprecisa), 0011 (peor caso, no promedio).
 - **Correctitud ante fallas:** 0005 (fraude vs error), 0009 (fail-closed),
-  0012 (Settlement), 0013 (ambigüedad del timeout e idempotencia), 0022 (conexión caída).
+  0012 (Settlement), 0013 (ambigüedad del timeout e idempotencia), 0022 (conexión caída), 0027 (reintentos responden lo registrado).
 - **Detección:** 0006 (qué se registra), 0007 (validación), 0008 (Redis),
   0010 (scoring).
 - **Medir y operar:** 0014 (load generator), 0026 (perfil de carga diario), 0015 (observabilidad), 0016

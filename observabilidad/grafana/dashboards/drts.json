@@ -682,7 +682,7 @@
     {
       "type": "timeseries",
       "title": "D_rem al llegar",
-      "description": "Cuánto le queda a cada request al llegar al handler, antes de la admisión. P1 = el 1% con menos tiempo. Hoy ronda los 200ms siempre: no hay espera antes del handler, por eso la admisión casi nunca actúa. La línea roja es el mínimo para admitir (35ms). Con un pool de workers (planificado) la espera en la cola va a hacer bajar esto.",
+      "description": "Cuánto le queda a cada request al llegar al handler, antes de la admisión. P1 = el 1% con menos tiempo. En reposo el P50 y el P1 se ven planos en ~175ms y ~150ms: es interpolación dentro del tramo 150-200ms del histograma, el valor real ronda los 200ms. Bajo sobrecarga el P1 cae (medido: a ~35-50ms): algunas requests pierden tiempo ANTES del handler (transporte gRPC y planificación, que también esperan CPU). La línea roja es el mínimo para admitir (35ms): lo que cae debajo son los EARLY_DROP.",
       "id": 11,
       "datasource": {
         "type": "prometheus",
@@ -977,7 +977,7 @@
     {
       "type": "timeseries",
       "title": "Duración de cada fase (P99)",
-      "description": "mandatoria = viaje 1 a Redis (presupuesto 20ms). opcional = scoring (presupuesto 80ms; ~16ms medido sin carga). settlement = llamada completa (reserva 15ms) = c_settle (adentro de Settlement) + c_net (red + gRPC). Bajo carga, la opcional es la que más crece: compite por CPU.",
+      "description": "mandatoria = viaje 1 a Redis (presupuesto 20ms). opcional = scoring (presupuesto 80ms; ~16ms medido sin carga). settlement = llamada completa (reserva 15ms) = c_settle (adentro de Settlement) + c_net (red + gRPC). Si sube UNA fase, el problema es esa dependencia. Si suben TODAS juntas (medido bajo sobrecarga), el motor está esperando CPU, no una dependencia lenta.",
       "id": 15,
       "datasource": {
         "type": "prometheus",
@@ -1065,7 +1065,7 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 8,
         "x": 0,
         "y": 43
       },
@@ -1132,8 +1132,8 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
-        "x": 12,
+        "w": 8,
+        "x": 8,
         "y": 43
       },
       "targets": [
@@ -1183,6 +1183,73 @@
               {
                 "color": "red",
                 "value": 0.2
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Reintentos resueltos con lo registrado",
+      "description": "Reintentos (mismo tx_id) que el motor respondió con lo que Settlement ya había registrado, sin volver a evaluar (ADR-0027). Sube cuando hay respuestas ambiguas: el cliente reintenta y el resultado ya estaba. Cada uno se ahorra el scoring (~16ms de CPU) y no puede decidir distinto que el intento registrado. En 0 con el sistema sano.",
+      "id": 33,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 43
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "range": true,
+          "expr": "sum by (estado) (rate(drts_respuestas_registradas_total[$__rate_interval]))",
+          "legendFormat": "{{estado}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 25,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
               }
             ]
           },
