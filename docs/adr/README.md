@@ -46,6 +46,7 @@ escriben: [ADR-0001](0001-registrar-decisiones-con-adrs.md) y la
 | [0025](0025-consumidores-y-auditoria.md) | Consumidores del cold path; la auditoría cruza los dos lados | Aceptada | 8 (Kafka) |
 | [0026](0026-perfil-de-carga-diario.md) | Perfil de carga diario (Poisson no homogéneo) | Aceptada | 6 (extiende el load generator) |
 | [0027](0027-reintento-responde-lo-registrado.md) | Un reintento responde lo registrado; sin registro no hay decisión | Aceptada (reemplaza parte de 0012) | corrección posterior a la 8 |
+| [0028](0028-metricas-de-evaluacion-sli-slo-sla.md) | Métricas de evaluación y objetivos (SLI, SLO y SLA) | Aceptada | transversal (evaluación por entornos) |
 
 ## Cómo leerlos
 
@@ -55,6 +56,6 @@ escriben: [ADR-0001](0001-registrar-decisiones-con-adrs.md) y la
   0012 (Settlement), 0013 (ambigüedad del timeout e idempotencia), 0022 (conexión caída), 0027 (reintentos responden lo registrado).
 - **Detección:** 0006 (qué se registra), 0007 (validación), 0008 (Redis),
   0010 (scoring).
-- **Medir y operar:** 0014 (load generator), 0026 (perfil de carga diario), 0015 (observabilidad), 0016
+- **Medir y operar:** 0014 (load generator), 0026 (perfil de carga diario), 0028 (métricas oficiales y SLOs), 0015 (observabilidad), 0016
   (tests reales), 0017 (configuración y apagado), 0018 (entornos), 0019
   (Kafka), 0020 (imágenes, salud y Compose), 0021 (logs), 0023 (redes), 0024 (eventos), 0025 (consumidores y auditoría).
