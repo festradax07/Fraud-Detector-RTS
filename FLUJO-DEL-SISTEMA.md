@@ -345,23 +345,26 @@ verifica un test, `TestCoherenciaDelDiseno`).
 
 ## 5. Dónde se evalúa el tiempo real (resumen)
 
-| # | Mecanismo | Módulo | Qué decide o mide | Si no alcanza el tiempo |
+Cada fila enlaza al **código exacto** (archivo y líneas) y a su
+**explicación con el fragmento de código** en el
+[anexo](#anexo-el-código-del-tiempo-real).
+
+| # | Mecanismo | Qué decide o mide | Si no alcanza el tiempo | Código |
 |---|---|---|---|---|
-| 1 | **Deadline del cliente** | `cmd/loadgen` | 200ms por transacción, medidos desde el instante programado | `DEADLINE_MISS` |
-| 2 | **Propagación del deadline** | gRPC (`grpc-timeout`), `internal/redisclient` (`ContextTimeoutEnabled`), `cmd/server` (`ctx` a Settlement) | el mismo plazo llega a Redis y a Settlement | cada I/O corta cuando vence |
-| 3 | **Admisión** | `internal/presupuesto.Admitir`, `cmd/server.admitir` | ¿$D_{rem} \ge 35ms$? | `EARLY_DROP`, sin trabajar |
-| 4 | **Fallo rápido** | `internal/redisclient` (sin reintentos) | no quemar el plazo esperando a un Redis caído | error en µs, fail-closed |
-| 5 | **Slack (Computación Imprecisa)** | `internal/presupuesto.Slack`, `cmd/server.faseOpcional` | ¿$S_i \ge 0$? | respuesta **degradada** (solo mandatoria) |
-| 6 | **Reserva para Settlement** | `cmd/server.liquidar` (`WithTimeout` 15ms) | Settlement no puede llevarse el plazo entero | `SETTLEMENT_TIMEOUT` (ambiguo) |
-| 7 | **Deadline global en Settlement** | `internal/settlement` | ¿la transacción ya superó los 200ms? | `ABORTED_TIMEOUT`: no se compromete |
-| 8 | **Detección de respuestas tardías** | `internal/metricas` (interceptor: `ctx.Err()` al terminar) | el servidor terminó para un cliente que ya se fue | métrica `drts_respuestas_tardias_total` |
-| 9 | **Medición** | `internal/metricas`, `cmd/loadgen` | D_rem al llegar, slack, duración de cada fase, $C_{net}$, latencia del cliente | — |
-| 10 | **Auditoría** (después, sin plazo) | `internal/auditoria`, `cmd/eventos` | ¿lo respondido coincide con lo registrado? | marca las discrepancias |
+| 1 | **Deadline del cliente** | 200ms por transacción, medidos desde el instante programado | `DEADLINE_MISS` | [loadgen `enviar`](cmd/loadgen/main.go#L222-L240) · [explicación](#m1) |
+| 2 | **Propagación del deadline** | el mismo plazo llega al motor, a Redis y a Settlement | cada I/O corta cuando vence | [motor `admitir`](cmd/server/main.go#L184-L189) · [Redis](internal/redisclient/redisclient.go#L20-L25) · [explicación](#m2) |
+| 3 | **Admisión** | ¿$D_{rem} \ge 35ms$? | `EARLY_DROP`, sin trabajar | [`Admitir`](internal/presupuesto/presupuesto.go#L42-L44) · [motor](cmd/server/main.go#L184-L198) · [explicación](#m3) |
+| 4 | **Fallo rápido** | no quemar el plazo esperando a un Redis caído | error en µs, fail-closed | [`redisclient`](internal/redisclient/redisclient.go#L26-L35) · [explicación](#m4) |
+| 5 | **Slack (Computación Imprecisa)** | ¿$S_i \ge 0$? | respuesta **degradada** | [`Slack`](internal/presupuesto/presupuesto.go#L52-L60) · [motor](cmd/server/main.go#L258-L273) · [explicación](#m5) |
+| 6 | **Reserva para Settlement** | Settlement no puede llevarse el plazo entero | `SETTLEMENT_TIMEOUT` (ambiguo) | [`liquidar`](cmd/server/main.go#L306-L330) · [explicación](#m6) |
+| 7 | **Deadline global en Settlement** | ¿la transacción ya superó los 200ms? | `ABORTED_TIMEOUT`: no se compromete | [Settlement](internal/settlement/settlement.go#L146-L158) · [explicación](#m7) |
+| 8 | **Respuestas tardías** | el servidor terminó para un cliente que ya se fue | métrica `drts_respuestas_tardias_total` | [interceptor](internal/metricas/metricas.go#L127-L143) · [explicación](#m8) |
+| 9 | **Medición del presupuesto** | $D_{rem}$ al llegar, slack, cada fase, $C_{net}$ | — | [`medirSettlement`](cmd/server/main.go#L401-L407) · [explicación](#m9) |
+| 10 | **El presupuesto cierra** | peor caso ≤ 200ms, verificado por un test | el test falla | [`TestCoherenciaDelDiseno`](internal/presupuesto/presupuesto_test.go#L63-L73) · [explicación](#m10) |
+| 11 | **Auditoría** (después, sin plazo) | ¿lo respondido coincide con lo registrado? | marca las discrepancias | [`Clasificar`](internal/auditoria/auditoria.go#L50-L82) · [explicación](#m11) |
 
 Lo que **no** es tiempo real, a propósito: el camino frío (Kafka y sus
 consumidores). No tiene deadline y no puede frenar una respuesta.
-
----
 
 ## 6. Qué pasa cuando algo falla
 
@@ -488,6 +491,361 @@ objetivo de la evaluación.
   latencia de referencia es la del cliente.
 
 ---
+
+## Anexo: el código del tiempo real
+
+Cada mecanismo de la [sección 5](#5-dónde-se-evalúa-el-tiempo-real-resumen),
+con el fragmento de código real que lo implementa y qué hace. Los enlaces
+abren el archivo en las líneas exactas.
+
+> Las líneas corresponden a `main` del 2026-10-27. Si el código cambia y una
+> línea ya no coincide, buscá por el nombre de la función: los nombres son
+> estables.
+
+<a id="m1"></a>
+### 1 · Deadline del cliente
+
+[cmd/loadgen/main.go, líneas 222–240](cmd/loadgen/main.go#L222-L240) (función `enviar`)
+
+```go
+for intento := 1; intento <= g.maxIntentos; intento++ {
+	req.EmissionTimestampNs = time.Now().UnixNano()
+	ctx, cancel := context.WithTimeout(context.Background(), g.deadline)
+	resp, err := g.cliente.EvaluateTransaction(ctx, req)
+	cancel()
+
+	cat, motivo := clasificar(err)
+	// ...
+	if intento == 1 {
+		r.latencia = time.Since(programada)
+		// ...
+```
+
+- `context.WithTimeout(..., g.deadline)` crea el plazo de **200ms** (el flag
+  `-deadline`) para esta llamada. gRPC lo convierte en el header
+  `grpc-timeout` y lo manda con la request: el servidor recibe **el mismo
+  plazo**, no uno propio.
+- `r.latencia = time.Since(programada)`: la latencia se mide desde el
+  instante **programado** de la llegada (el que sorteó el proceso de
+  Poisson), no desde que la llamada salió. Si el propio generador se atrasa,
+  el atraso cuenta. Es lo que evita la *coordinated omission*.
+- `clasificar(err)` decide si fue `PROCESSED`, `EARLY_DROP`,
+  `DEADLINE_MISS`, `AMBIGUOUS` o `ERROR`. Un `DEADLINE_MISS` solo lo puede
+  ver el cliente: es su timer el que venció.
+- Cada reintento es una emisión nueva (`EmissionTimestampNs` se renueva) con
+  su propio deadline: un reintento con la emisión original llegaría tarde por
+  definición.
+
+<a id="m2"></a>
+### 2 · Propagación del deadline
+
+**Del lado del motor:** [cmd/server/main.go, líneas 184–189](cmd/server/main.go#L184-L189)
+
+```go
+func (s *fraudEngineServer) admitir(ctx context.Context, tr *traza) (time.Time, error) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return time.Time{}, fallas.Nueva(codes.InvalidArgument, fallas.SinDeadline, "la llamada debe traer un deadline")
+	}
+	restante := time.Until(deadline) // D_rem
+```
+
+- gRPC reconstruyó el plazo del header y lo puso en el `ctx`.
+  `ctx.Deadline()` lo lee: es el **mismo instante** que fijó el cliente.
+- Sin deadline, la request se rechaza: procesarla "sin límite" taparía un bug
+  del cliente.
+- De acá en adelante, todo el I/O recibe **este** `ctx`. Por eso el código
+  nunca usa `context.Background()` en el camino caliente: se perdería el
+  plazo.
+
+**Hasta Redis:** [internal/redisclient/redisclient.go, líneas 20–25](internal/redisclient/redisclient.go#L20-L25)
+
+```go
+func Nuevo(addr string) *redis.Client {
+	return redis.NewClient(&redis.Options{
+		Addr: addr,
+		// Sin esto go-redis IGNORA el deadline del ctx y usa sus propios
+		// timeouts (3s por defecto): el deadline de 200ms no llegaría a Redis.
+		ContextTimeoutEnabled: true,
+```
+
+- Una línea que cambia todo: sin `ContextTimeoutEnabled`, go-redis esperaría
+  hasta 3 segundos por Redis aunque a la transacción le queden 10ms.
+
+<a id="m3"></a>
+### 3 · Control de admisión
+
+**La regla:** [internal/presupuesto/presupuesto.go, líneas 42–44](internal/presupuesto/presupuesto.go#L42-L44)
+
+```go
+func Admitir(dRem time.Duration) bool {
+	return dRem >= MinParaAdmitir
+}
+```
+
+**Dónde se aplica:** [cmd/server/main.go, líneas 189–198](cmd/server/main.go#L189-L198)
+
+```go
+	restante := time.Until(deadline) // D_rem
+	tr.dremLlegada = restante
+	// Si este valor baja de ~200ms, hay espera ANTES del handler.
+	s.metricas.DRemLlegada(restante)
+	if !presupuesto.Admitir(restante) {
+		return time.Time{}, fallas.Nueva(codes.DeadlineExceeded, fallas.EarlyDrop,
+			fmt.Sprintf("deadline insuficiente: quedan %v, se necesitan al menos %v", restante, presupuesto.MinParaAdmitir))
+	}
+```
+
+- $D_{rem}$ = el deadline menos ahora. `MinParaAdmitir` es
+  `WCETMandatoria + ReservaSettleNet` = 20 + 15 = 35ms. Si no alcanza para lo
+  mínimo (la mandatoria más Settlement y la red), se rechaza **antes de hacer nada**:
+  no se consulta Redis, no se gasta CPU. Es *load shedding*.
+- La regla es una **función pura** (recibe una duración, no mira el reloj):
+  se testea a 1µs de distancia del borde, donde se esconden los errores de
+  `<` contra `<=`.
+- `s.metricas.DRemLlegada(restante)` registra con cuánto tiempo llegó cada
+  request: si baja de ~200ms, hubo espera antes de entrar.
+
+<a id="m4"></a>
+### 4 · Fallo rápido
+
+[internal/redisclient/redisclient.go, líneas 26–35](internal/redisclient/redisclient.go#L26-L35)
+
+```go
+		// Sin reintentos: con Redis caído, fallar en microsegundos y no quemar
+		// el deadline entero esperando (load shedding también ante fallas).
+		// ...
+		MaxRetries: -1,
+		// DialerRetries cuenta INTENTOS totales, no reintentos (el código es
+		// `for attempt < DialerRetries`), y 0 = default 5. 1 = un solo intento.
+		DialerRetries: 1,
+```
+
+- Por defecto go-redis reintenta (3 comandos, 5 conexiones). Con Redis
+  caído, esos reintentos se comerían los 200ms enteros (medido: 200ms
+  contra ~1ms sin reintentos).
+- Sin reintentos, el error llega en microsegundos, la transacción se
+  rechaza (**fail-closed**: sin verificar no se aprueba) y el cliente puede
+  reintentar con el mismo `tx_id` sin que cuente doble.
+- Es un mecanismo de tiempo real aunque no mire el reloj: **acota el peor
+  caso** ante una falla.
+
+<a id="m5"></a>
+### 5 · Slack: la Computación Imprecisa
+
+**La regla:** [internal/presupuesto/presupuesto.go, líneas 52–60](internal/presupuesto/presupuesto.go#L52-L60)
+
+```go
+func Slack(dRem time.Duration) time.Duration {
+	return dRem - ReservaSettleNet - WCETOpcional
+}
+
+func CorreOpcional(dRem time.Duration) bool {
+	return Slack(dRem) >= 0
+}
+```
+
+**Dónde se aplica:** [cmd/server/main.go, líneas 258–273](cmd/server/main.go#L258-L273)
+
+```go
+func (s *fraudEngineServer) faseOpcional(ctx context.Context, req *pb.TransactionRequest, stats opcional.Estadisticas, deadline time.Time, tr *traza) (score float64, degradada bool) {
+	restante := time.Until(deadline)
+	slack := presupuesto.Slack(restante)
+	tr.slack = slack
+	s.metricas.Slack(slack)
+	if !presupuesto.CorreOpcional(restante) {
+		// ...
+		return 0, true
+	}
+	t := time.Now()
+	score = opcional.Puntuar(req.Amount, stats, s.iteraciones)
+	s.metricas.Fase(metricas.FaseOpcional, time.Since(t))
+	return score, false
+}
+```
+
+- `Slack` es $S_i = D_{rem} - 15 - 80$: lo que sobraría si el scoring
+  tardara su peor caso y después viniera Settlement.
+- `time.Until(deadline)` **se vuelve a calcular acá**, después de la
+  mandatoria: lo que importa es cuánto queda **ahora**, con el viaje a Redis
+  ya pagado.
+- Si el slack es negativo, se devuelve `degradada = true` sin correr el
+  scoring: la respuesta sale solo con la mandatoria, **a tiempo**. Es la
+  idea central de Liu et al. (1991): la parte opcional se sacrifica para
+  cumplir el deadline.
+- El slack se registra siempre (`s.metricas.Slack`): el dashboard muestra
+  cuánto margen hay y cuándo empieza a faltar.
+
+<a id="m6"></a>
+### 6 · La reserva para Settlement
+
+[cmd/server/main.go, líneas 306–330](cmd/server/main.go#L306-L330) (función `liquidar`)
+
+```go
+	ctxSettle, cancel := context.WithTimeout(ctx, presupuesto.ReservaSettleNet)
+	defer cancel()
+	// ...
+	sr, err := s.settle.CommitTransaction(ctxSettle, &pb.SettlementRequest{
+		// ...
+		EmissionTimestampNs: req.EmissionTimestampNs,
+	}, grpc.Trailer(&trailer))
+	// ...
+	if err != nil {
+		return nil, fallaDeSettlement(ctx, req.TxId, err)
+	}
+	return respuestaSegunRegistro(ctx, req.TxId, eval, sr)
+```
+
+- `context.WithTimeout(ctx, 15ms)` **deriva** del `ctx` de la request: la
+  llamada a Settlement vence a los 15ms **o** cuando venza la request, lo que
+  pase primero. `WithTimeout` nunca alarga un plazo.
+- Así, un Settlement lento o colgado no se lleva el deadline entero: como
+  mucho, los 15ms que el slack ya le había reservado.
+- Si vence, la respuesta es **ambigua** (`SETTLEMENT_TIMEOUT`): Settlement
+  pudo haber registrado igual. El cliente reintenta con el mismo `tx_id`
+  ([ADR-0013](docs/adr/0013-ambiguedad-del-timeout-e-idempotencia.md),
+  [ADR-0027](docs/adr/0027-reintento-responde-lo-registrado.md)).
+- `EmissionTimestampNs` viaja a Settlement para el mecanismo 7.
+
+<a id="m7"></a>
+### 7 · El deadline global, otra vez, en Settlement
+
+[internal/settlement/settlement.go, líneas 146–158](internal/settlement/settlement.go#L146-L158)
+
+```go
+	var latencia time.Duration
+	if req.EmissionTimestampNs > 0 {
+		latencia = inicio.Sub(time.Unix(0, req.EmissionTimestampNs))
+		// Tiempo real duro: una respuesta correcta que llega tarde es una
+		// falla. Si ya se pasó el deadline global, NO se compromete nada.
+		if latencia > presupuesto.DeadlineGlobal {
+			estado = pb.TxStatus_STATUS_ABORTED_TIMEOUT
+		}
+	}
+```
+
+- Settlement es la **última barrera** antes de comprometer la plata: calcula
+  cuánto pasó desde que el cliente emitió la transacción y, si ya son más de
+  200ms, registra `ABORTED_TIMEOUT` en lugar de comprometer.
+- Comprometer algo tardío sería dar por buena una respuesta que, en tiempo
+  real duro, ya es una falla.
+- Compara los relojes de dos procesos: vale en una sola máquina; entre hosts
+  depende de que los relojes estén sincronizados.
+
+<a id="m8"></a>
+### 8 · Detectar las respuestas tardías
+
+[internal/metricas/metricas.go, líneas 127–143](internal/metricas/metricas.go#L127-L143) (el interceptor gRPC)
+
+```go
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		r.enVuelo.Inc()
+		defer r.enVuelo.Dec()
+
+		inicio := time.Now()
+		resp, err := handler(ctx, req) // acá corre el handler de verdad
+		r.latencia.Observe(time.Since(inicio).Seconds())
+		// ...
+		// El servidor NO se entera de un DEADLINE_MISS: para él la request
+		// "salió bien", aunque el cliente ya se fue. Esta es la forma de
+		// verlo de este lado: terminar con el contexto ya vencido.
+		if ctx.Err() != nil {
+			r.tardias.Inc()
+		}
+```
+
+- Un interceptor envuelve **todas** las requests sin tocar el handler.
+- Al terminar, `ctx.Err() != nil` significa que el plazo ya venció: el
+  cliente dejó de esperar. El servidor trabajó para nadie.
+- Es la única forma de ver un deadline incumplido **desde el servidor**. Por
+  eso la métrica de referencia es la del cliente (mecanismo 1), y por eso los
+  SLIs se miden en el borde
+  ([ADR-0028](docs/adr/0028-metricas-de-evaluacion-sli-slo-sla.md)).
+
+<a id="m9"></a>
+### 9 · Medir el presupuesto: separar Settlement de la red
+
+[cmd/server/main.go, líneas 401–407](cmd/server/main.go#L401-L407)
+
+```go
+func (s *fraudEngineServer) medirSettlement(total time.Duration, trailer metadata.MD) {
+	s.metricas.Fase(metricas.FaseSettlement, total)
+	if cSettle, ok := leerCSettle(trailer); ok {
+		s.metricas.Fase(metricas.FaseCSettle, cSettle)
+		s.metricas.Fase(metricas.FaseCNet, total-cSettle)
+	}
+}
+```
+
+- El presupuesto reserva 15ms para $C_{settle} + C_{net}$. Para saber si
+  alcanza, hay que medir **cada parte**.
+- Settlement informa su tiempo interno ($C_{settle}$) en un *trailer* gRPC.
+  El motor mide la llamada completa y despeja
+  $C_{net} = total - C_{settle}$: el costo de la red.
+- Lo mismo se hace con cada fase (mandatoria, opcional): son los datos para
+  recalibrar los presupuestos con mediciones, entorno por entorno.
+
+<a id="m10"></a>
+### 10 · El presupuesto cierra (verificado por un test)
+
+[internal/presupuesto/presupuesto_test.go, líneas 63–73](internal/presupuesto/presupuesto_test.go#L63-L73)
+
+```go
+func TestCoherenciaDelDiseno(t *testing.T) {
+	if MinParaAdmitir != 35*ms {
+		t.Errorf("MinParaAdmitir = %v, el diseño parte de 35ms", MinParaAdmitir)
+	}
+	// Lo peor que puede tardar una transacción completa tiene que entrar en
+	// el deadline global de 200ms.
+	peorCaso := WCETMandatoria + WCETOpcional + ReservaSettleNet
+	if peorCaso > DeadlineGlobal {
+		t.Errorf("M + O + settle + net = %v, no entra en %v", peorCaso, DeadlineGlobal)
+	}
+}
+```
+
+- Es el análisis de factibilidad del diseño, escrito como test: la suma de
+  los peores casos ($20 + 80 + 15 = 115\text{ms}$) tiene que entrar en los
+  200ms.
+- Si alguien sube un presupuesto (por ejemplo, el WCET de la opcional a
+  110ms), el test falla y avisa que la cuenta del diseño dejó de cerrar.
+
+<a id="m11"></a>
+### 11 · La auditoría: verificar después
+
+[internal/auditoria/auditoria.go, líneas 50–82](internal/auditoria/auditoria.go#L50-L82)
+
+```go
+func Clasificar(evaluadas []*pb.TransaccionEvaluada, liquidada *pb.TransaccionLiquidada) Resultado {
+	ev := ultima(evaluadas)
+	switch {
+	case ev == nil:
+		return EventoPerdido
+	case ev.Evaluacion == nil: // el motor no respondió una decisión (error)
+		if liquidada != nil && liquidada.Estado == pb.TxStatus_STATUS_COMMITTED {
+			return AmbiguaComprometida
+		}
+		return NoComprometida
+	// ...
+	default: // aprobada
+		if liquidada.Estado == pb.TxStatus_STATUS_COMMITTED {
+			return Consistente
+		}
+		return Inconsistente
+	}
+}
+```
+
+- No es tiempo real (corre en el camino frío, sin deadline), pero **verifica
+  que cumplir el tiempo no haya roto la correctitud**: cruza lo que respondió
+  el motor con lo que registró Settlement.
+- `AmbiguaComprometida`: el cliente recibió un error (por ejemplo, un
+  timeout) y la plata se comprometió igual. Es el costo de negocio de los
+  deadlines incumplidos.
+- `Inconsistente`: la respuesta contradice el registro. Tiene que ser 0
+  siempre. Así se encontró, bajo carga, el bug que corrigió el ADR-0027.
+- Es una función pura: recibe los dos eventos y devuelve un resultado, sin
+  I/O. Se testea caso por caso.
 
 ## Glosario
 
