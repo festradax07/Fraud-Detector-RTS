@@ -3,11 +3,20 @@
 **D-RTS** (*Distributed Real-Time Fraud Detection System*) es un motor de
 autorización de pagos que decide si aprueba o rechaza cada transacción bajo un
 **deadline duro de 200ms de extremo a extremo**. Está escrito en Go, sobre
-gRPC y Redis, con un segundo servicio (Settlement), un generador de carga
-propio y observabilidad con Prometheus y Grafana.
+gRPC y Redis, con un segundo servicio (Settlement), Kafka como columna de
+eventos (auditoría, alertas, estadísticas), un generador de carga propio y
+observabilidad con Prometheus y Grafana. Corre en binarios nativos y en
+Docker Compose, y está diseñado para medirse también en AWS.
 
 Es el proyecto de la materia *Sistemas en Tiempo Real*. Cada decisión de
 diseño está registrada como un ADR en [`docs/adr/`](docs/adr/README.md).
+
+| Para… | Leé |
+|---|---|
+| entender el sistema paso a paso y dónde se evalúa el tiempo real | [FLUJO-DEL-SISTEMA.md](FLUJO-DEL-SISTEMA.md) |
+| saber cómo se evalúa (métricas oficiales, SLI, SLO) | [ADR-0028](docs/adr/0028-metricas-de-evaluacion-sli-slo-sla.md) |
+| leer el dashboard y diagnosticar con él | [observabilidad/GUIA-DASHBOARD.md](observabilidad/GUIA-DASHBOARD.md) |
+| ver la arquitectura en la nube | [En la nube: AWS](#en-la-nube-aws-propuesta) |
 
 ---
 
@@ -20,7 +29,9 @@ diseño está registrada como un ADR en [`docs/adr/`](docs/adr/README.md).
 - [Componentes](#componentes)
 - [Estructura del repositorio y por qué](#estructura-del-repositorio-y-por-qué)
 - [Decisiones de diseño (ADRs)](#decisiones-de-diseño-adrs)
+- [Cómo se evalúa](#cómo-se-evalúa)
 - [Lo que mostraron las mediciones](#lo-que-mostraron-las-mediciones)
+- [En la nube: AWS (propuesta)](#en-la-nube-aws-propuesta)
 - [Cómo correrlo](#cómo-correrlo)
 - [Configuración](#configuración)
 - [Observabilidad](#observabilidad)
@@ -296,7 +307,9 @@ solo si cambia un `.proto`.
 ├── internal/              toda la lógica (no importable desde afuera del módulo)
 ├── observabilidad/        Prometheus y Grafana, provisionados desde archivos
 ├── perfiles/              curvas de carga del día para el loadgen (ADR-0026)
-├── docs/adr/              decisiones de diseño
+├── docs/adr/              decisiones de diseño (img/: el diagrama de AWS, generado por código)
+├── FLUJO-DEL-SISTEMA.md   una transacción paso a paso y dónde se evalúa el tiempo real
+├── infra/                 Terraform para AWS (próximamente, Etapa 7.6)
 ├── Dockerfile             una imagen por servicio (--target)
 ├── docker-compose.yml     el sistema completo, por perfiles
 ├── Makefile               atajos
@@ -334,37 +347,99 @@ solo si cambia un `.proto`.
 | Tema | ADRs |
 |---|---|
 | **Modelo de tiempo real** | [0002](docs/adr/0002-camino-de-decision-sincronico-con-grpc.md) camino sincrónico con deadline propagado · [0003](docs/adr/0003-control-de-admision-temprano.md) admisión temprana · [0004](docs/adr/0004-computacion-imprecisa.md) computación imprecisa · [0011](docs/adr/0011-costo-simulado-y-wcet.md) peor caso, no promedio |
-| **Correctitud ante fallas** | [0005](docs/adr/0005-fraude-no-es-error.md) un fraude no es un error · [0009](docs/adr/0009-fail-closed-y-fallo-rapido.md) fail-closed y fallo rápido · [0012](docs/adr/0012-settlement-segundo-servicio-sincronico.md) Settlement con timeout propio · [0013](docs/adr/0013-ambiguedad-del-timeout-e-idempotencia.md) ambigüedad del timeout e idempotencia · [0022](docs/adr/0022-conexion-caida-es-resultado-ambiguo.md) conexión caída = ambiguo |
+| **Correctitud ante fallas** | [0005](docs/adr/0005-fraude-no-es-error.md) un fraude no es un error · [0009](docs/adr/0009-fail-closed-y-fallo-rapido.md) fail-closed y fallo rápido · [0012](docs/adr/0012-settlement-segundo-servicio-sincronico.md) Settlement con timeout propio · [0013](docs/adr/0013-ambiguedad-del-timeout-e-idempotencia.md) ambigüedad del timeout e idempotencia · [0022](docs/adr/0022-conexion-caida-es-resultado-ambiguo.md) conexión caída = ambiguo · [0027](docs/adr/0027-reintento-responde-lo-registrado.md) un reintento responde lo registrado |
 | **Detección** | [0006](docs/adr/0006-que-se-registra-ante-un-rechazo.md) qué se registra ante un rechazo · [0007](docs/adr/0007-validacion-estricta-de-la-request.md) validación · [0008](docs/adr/0008-redis-un-viaje-atomico.md) Redis en un viaje atómico · [0010](docs/adr/0010-modelo-de-scoring.md) scoring |
 | **Cold path (Kafka)** | [0019](docs/adr/0019-kafka-como-columna-de-eventos.md) Kafka al costado · [0023](docs/adr/0023-redes-como-subredes-privadas.md) redes como subredes privadas · [0024](docs/adr/0024-eventos-en-protobuf-sin-bloquear.md) eventos en protobuf sin bloquear · [0025](docs/adr/0025-consumidores-y-auditoria.md) consumidores y auditoría |
-| **Medir y operar** | [0014](docs/adr/0014-load-generator-de-lazo-abierto.md) generador de lazo abierto · [0015](docs/adr/0015-observabilidad-prometheus-grafana.md) observabilidad · [0016](docs/adr/0016-tests-contra-infraestructura-real.md) tests reales · [0017](docs/adr/0017-configuracion-por-entorno-y-apagado-ordenado.md) configuración y apagado · [0018](docs/adr/0018-evaluar-en-distintos-entornos.md) evaluar por entornos · [0020](docs/adr/0020-imagenes-salud-y-compose.md) imágenes, salud y Compose · [0021](docs/adr/0021-logs-con-niveles.md) logs con niveles |
+| **Medir y operar** | [0014](docs/adr/0014-load-generator-de-lazo-abierto.md) generador de lazo abierto · [0015](docs/adr/0015-observabilidad-prometheus-grafana.md) observabilidad · [0016](docs/adr/0016-tests-contra-infraestructura-real.md) tests reales · [0017](docs/adr/0017-configuracion-por-entorno-y-apagado-ordenado.md) configuración y apagado · [0018](docs/adr/0018-evaluar-en-distintos-entornos.md) evaluar por entornos · [0020](docs/adr/0020-imagenes-salud-y-compose.md) imágenes, salud y Compose · [0021](docs/adr/0021-logs-con-niveles.md) logs con niveles · [0026](docs/adr/0026-perfil-de-carga-diario.md) perfil de carga diario · [0028](docs/adr/0028-metricas-de-evaluacion-sli-slo-sla.md) métricas oficiales, SLI y SLO |
+
+## Cómo se evalúa
+
+El dashboard sirve para diagnosticar; lo que se **reporta** son las métricas
+del contrato de tiempo real, medidas **en el borde** del sistema (el
+loadgen) y calculadas desde el CSV de cada transacción
+([ADR-0028](docs/adr/0028-metricas-de-evaluacion-sli-slo-sla.md)):
+
+| Métrica oficial (SLI) | Objetivo (SLO) |
+|---|---|
+| Decisiones a tiempo (1 − *Deadline Miss Ratio*) | ≥ 99% |
+| Latencia ≤ 100ms | ≥ 99% |
+| Decisiones con scoring (no degradadas) | ≥ 99% |
+| Correctitud (la respuesta coincide con lo registrado) | 100% |
+| Sin ambiguas comprometidas | ≥ 99,9% |
+
+Los objetivos valen **dentro de una envolvente de carga** (inicial: 400 RPS
+en la notebook de desarrollo): el SLO es el mismo en todos los entornos, y
+lo que se compara es **hasta qué carga se cumple**. Cada transacción tiene
+un deadline duro (tarde = falla), pero la garantía del sistema es
+estadística: en la nube no se puede probar un peor caso, solo medirlo
+(*firm real-time*).
 
 ## Lo que mostraron las mediciones
 
-Medido en la notebook de desarrollo (Intel i7-12650H, 16 hilos), todo en la
-misma máquina y con el cargador conectado. Son datos de **ese** entorno; la
-comparación formal entre entornos está en curso. Ojo: a batería, el CPU baja
-a menos de la mitad de su frecuencia y la latencia se duplica, así que el
-estado de energía es parte de cada medición.
+Medido en la notebook de desarrollo (Intel i7-12650H, 16 hilos), en Docker
+Compose, con el cargador conectado y el perfil de energía en `performance`.
+Son datos de **ese** entorno: la comparación formal entre entornos es lo que
+sigue. A batería, el CPU baja a menos de la mitad de su frecuencia y la
+latencia se duplica, así que el estado de energía es parte de cada medición.
 
 | Qué | Resultado |
 |---|---|
 | Fase mandatoria: 6 comandos a Redis | uno por uno: P50 133µs · con `TxPipeline`: **P50 27µs** (≈ 1 viaje) |
 | Red entre motor y Settlement (`C_net`) | P50 0.34ms, P99 0.68ms, contra 15ms reservados |
-| Scoring con 40M iteraciones de costo simulado | media 65ms (entra en 80ms) pero **P99 81ms** (no entra): por eso se presupuesta por peor caso |
+| Scoring con costo simulado | se presupuesta por **peor caso**: con 40M iteraciones, media 65ms pero P99 81ms (no entraba en 80ms) |
 | Redis caído | sin reintentos: `Unavailable` en **~1ms**; con los reintentos por defecto de go-redis, 200ms |
-| Carga de 350 RPS | **100%** dentro del deadline, P99 44ms |
-| Carga de 700 / 1400 RPS | 56% / 11% dentro del deadline: **colapso por congestión** (el goodput cae de ~205/s a ~62/s) |
-| Sistema completo en Docker Compose, 300 RPS | 100% dentro del deadline, P50 19ms, P99 31ms |
-| Apagado con SIGTERM a mitad de carga | **0** transacciones en vuelo perdidas (con SIGKILL se cortan todas a la vez) |
-| Kafka arriba / caído / deshabilitado, 300 RPS | el camino de decisión da **igual** en los tres (100%, P50 ~19ms); con Kafka caído los eventos esperan en el buffer |
-| Auditoría en Compose, 300 RPS | detectó **99 ambiguas comprometidas** que antes eran invisibles |
+| CPU por transacción en el motor | **~21ms** (casi todo, el scoring simulado): fija la capacidad |
+| Quiebre | **~500 RPS**: arriba, el % a tiempo cae; se recupera en menos de 5s al bajar de ~470 RPS |
+| Un día de carga (pico 800 RPS, 24 min) | 85% a tiempo en el día; en los picos de las 12h y las 19h, ~65–67% |
+| Ventana del mediodía, antes y después del [ADR-0027](docs/adr/0027-reintento-responde-lo-registrado.md) | **~75% → ~97%** a tiempo; ambiguas comprometidas 16% → ~1%; inconsistentes 20 → **0** |
+| Kafka arriba / caído / deshabilitado | el camino de decisión da **igual** en los tres; con Kafka caído los eventos esperan en el buffer y se entregan al volver |
+| Apagado con SIGTERM a mitad de carga | **0** transacciones en vuelo perdidas |
 
-El colapso por congestión es el hallazgo más importante hasta ahora: sin una
-cola delante del handler, toda request pasa la admisión con ~200ms y después
-todas compiten por el CPU y vencen juntas. La admisión solo protege si hay
-espera que consuma $D_{rem}$
-([ADR-0003](docs/adr/0003-control-de-admision-temprano.md)).
+Dos hallazgos importan más:
+
+- **El colapso por congestión.** Sin una cola delante del handler, toda
+  request pasa la admisión con ~200ms y después todas compiten por el CPU y
+  vencen juntas: pasado el quiebre, el sistema entrega **menos** que con
+  menos carga. La admisión solo protege si hay espera que consuma $D_{rem}$
+  ([ADR-0003](docs/adr/0003-control-de-admision-temprano.md)).
+- **La auditoría encontró un bug que ningún test había visto:** bajo
+  sobrecarga, un reintento podía responder "rechazada" sobre una transacción
+  ya cobrada (dos intentos decidían distinto: uno degradado, otro con
+  scoring). Se corrigió en el ADR-0027, y de paso los reintentos dejaron de
+  pagar el scoring, lo que desarmó la tormenta de reintentos.
+
+## En la nube: AWS (propuesta)
+
+![Arquitectura propuesta en AWS](docs/adr/img/arquitectura-aws.png)
+
+El mismo sistema, con **las mismas imágenes** y **la misma observabilidad**,
+pero distribuido: cada pieza en su host y hablando por la red real. Es la
+diferencia con la notebook que se quiere medir. Al mismo tiempo, está
+diseñado para costar poco: se crea con Terraform, se mide y se destruye.
+Estado: **diseño**. La implementación es la Etapa 7.6; las decisiones van al
+ADR-0029 y el diagrama se genera desde
+[`docs/adr/img/arquitectura-aws.py`](docs/adr/img/arquitectura-aws.py).
+
+**Qué hace cada parte:**
+
+| Parte | Dónde corre | Qué hace |
+|---|---|---|
+| **loadgen** | EC2 propia (c7i.large, spot), en la subred borde | Genera la carga que se **mide**. Hace de pasarela de pagos: está cerca del sistema, así que su latencia no incluye internet. Los 200ms son el presupuesto del motor, no del pago completo |
+| **ALB interno** | subred aplicación | Reparte las llamadas gRPC **por request** entre las réplicas del motor (un balanceador de conexiones mandaría todo a una sola, porque HTTP/2 mantiene la conexión abierta) |
+| **Fraud-Engine** | ECS, de 2 a 8 réplicas en c7i.large (una on-demand de base, el resto spot) | Decide cada transacción: admisión, mandatoria, slack, scoring. **Escala horizontalmente** según las requests por réplica, y con escalado programado antes de los picos conocidos del día |
+| **Settlement + Redis** | EC2 de datos (c7i.large, **on-demand**: Redis guarda estado) | Settlement registra cada decisión una sola vez; Redis guarda la blacklist, la ventana de velocidad, las posiciones, las estadísticas y los registros |
+| **Kafka** | EC2 propia (t3.medium) | La columna de eventos. Un broker sin replicación, declarado (en producción serían 3 o MSK) |
+| **Consumidores** | EC2 fría (t3.large) | Auditoría, alertas y estadísticas en sombra, como en local |
+| **Prometheus + Grafana** | EC2 fría | Las mismas métricas y el mismo dashboard que en local. Prometheus descubre las réplicas nuevas por las etiquetas de EC2; Grafana suma CloudWatch como segunda fuente y se accede por un túnel de SSM, no es pública |
+| **CloudWatch** | servicio de AWS | La infraestructura: instancias, réplicas, el ALB (con su propia medición de latencia en el borde), el auto scaling y los logs |
+| **Demo con QR** | ALB público + gateway, solo en modo demo | Los asistentes compran (o intentan un fraude) desde el celular. El gateway pone el deadline de 200ms en el borde, como una pasarela real, y muestra aparte la latencia de internet de cada uno |
+| **Gestión** | GitHub Actions, GHCR, Terraform | Las imágenes se construyen una vez y se promueven por digest; Terraform crea y destruye el entorno; el acceso a AWS es por OIDC, sin claves guardadas; una alarma de presupuesto vigila el gasto |
+
+**Cómo se mantiene barato:** spot en los motores y el loadgen, una sola
+zona, Redis y Kafka propios en lugar de servicios administrados, instancias
+t3 solo en el camino frío (sus créditos de CPU no afectan al deadline), sin
+NAT Gateway y todo efímero. Orden de magnitud: menos de un dólar por hora
+mientras está prendido.
 
 ## Cómo correrlo
 
@@ -514,8 +589,13 @@ respuesta, un puerto donde no escucha nadie.
 | Contenedores: configuración por entorno, apagado ordenado, salud, Compose | ✅ |
 | Kafka como columna de eventos: Kafka, redes privadas, eventos en protobuf publicados sin bloquear | ✅ ([ADR-0023](docs/adr/0023-redes-como-subredes-privadas.md), [ADR-0024](docs/adr/0024-eventos-en-protobuf-sin-bloquear.md)) |
 | Consumidores: auditoría con detección de discrepancias, estadísticas en vivo (sombra), alertas; TTL en Settlement | ✅ ([ADR-0025](docs/adr/0025-consumidores-y-auditoria.md)) |
+| Perfil de carga diario: Poisson no homogéneo, picos al mediodía y a las 19h | ✅ ([ADR-0026](docs/adr/0026-perfil-de-carga-diario.md)) |
+| Corrección: un reintento responde lo registrado (lo encontró la auditoría) | ✅ ([ADR-0027](docs/adr/0027-reintento-responde-lo-registrado.md)) |
+| Métricas oficiales y objetivos (SLI, SLO, SLA) | ✅ ([ADR-0028](docs/adr/0028-metricas-de-evaluacion-sli-slo-sla.md)) |
 | Experimento: Kafka en el camino de decisión (modo asíncrono) | planificado |
-| Nube (AWS) | planificado |
+| Nube (AWS): arquitectura y diagrama | ✅ diseño · ADR-0029 por escribir |
+| Nube (AWS): Terraform, CI/CD, medición (fase 1: una EC2 · fase 2: distribuido con auto scaling) | en curso |
+| Demo interactiva con QR | planificado |
 | Calibración por entorno: pool de workers contra el colapso por congestión, pausas del GC, comparación nativo / Compose / nube | planificado |
 
 ## Referencias

@@ -115,6 +115,7 @@ nota(145, 1065, ["build una vez (en dev),", "promoción por digest a AWS,", "cre
 
 # --- AWS --------------------------------------------------------------------
 caja(300, 100, 1580, 1100, "AWS · us-east-1", "#232f3e", "#ffffff", radio=14, clase="aws")
+icono("aws/management/cloudwatch.png", 1260, 160, 40, "CloudWatch", "infra · auto scaling\nlogs · ALB")
 icono("aws/security/identity-and-access-management-iam-role.png", 1380, 160, 40, "Rol OIDC", "sin claves guardadas")
 icono("aws/storage/simple-storage-service-s3.png", 1500, 160, 40, "S3", "state de Terraform")
 icono("aws/cost/budgets.png", 1620, 160, 40, "Budgets", "alarma de gasto")
@@ -138,10 +139,11 @@ icono("aws/compute/elastic-container-service-container.png", 515, 770, 50, "gate
 
 # Aplicación: ALB interno y las réplicas del motor
 icono("aws/network/elb-application-load-balancer.png", 760, 690, 56, "ALB interno", "gRPC · balancea\npor request")
-caja(860, 310, 240, 820, "ECS · motores (auto scaling)", "#e8590c", "#fff8f3", "5 3")
-nota(980, 1115, ["las 3 réplicas hablan con Settlement y Redis"], "#e8590c", ancla="middle", clase="sub")
-for i, y in enumerate([470, 700, 930]):
-    caja(880, y - 115, 200, 210, f"EC2 motor {i + 1} · c7i.xlarge spot", "#e8590c", "#ffffff")
+caja(860, 310, 240, 820, "ECS · motores: auto scaling 2–8", "#e8590c", "#fff8f3", "5 3")
+nota(980, 1080, ["mínimo 2 (N+1), máximo 8", "escala por requests por réplica (ALB)", "+ programado para los picos"], "#e8590c", ancla="middle", clase="sub")
+for i, (y, compra) in enumerate([(470, "on-demand (base)"), (700, "spot"), (930, "spot · sumada al escalar")]):
+    caja(880, y - 115, 200, 210, f"EC2 motor {i + 1} · c7i.large", "#e8590c", "#ffffff", "4 3" if i == 2 else "")
+    nota(980, y - 76, [compra], "#e8590c", ancla="middle", clase="sub")
     icono("aws/compute/elastic-container-service-container.png", 980, y - 10, 50, "fraud-engine",
           "admisión · mandatoria\nslack · scoring")
 
@@ -157,8 +159,8 @@ caja(1530, 310, 290, 820, "EC2 frío · t3.large", "#1c7ed6", "#f3f8ff")
 icono("aws/compute/elastic-container-service-container.png", 1600, 420, 44, "auditoría", "cruza motor\ncon Settlement")
 icono("aws/compute/elastic-container-service-container.png", 1750, 420, 44, "alertas", "un aviso\npor fraude")
 icono("aws/compute/elastic-container-service-container.png", 1675, 600, 44, "estadísticas", "en sombra (Welford)")
-icono("onprem/monitoring/prometheus.png", 1600, 830, 52, "Prometheus", "scrape cada 1s")
-icono("onprem/monitoring/grafana.png", 1750, 830, 52, "Grafana", "por túnel SSM\n(no público)")
+icono("onprem/monitoring/prometheus.png", 1600, 830, 52, "Prometheus", "scrape cada 1s\ndescubre por tags EC2")
+icono("onprem/monitoring/grafana.png", 1750, 830, 52, "Grafana", "Prometheus + CloudWatch\npor túnel SSM (no público)")
 nota(1675, 1010, ["créditos de CPU: no afectan", "al deadline (camino frío)"], "#1c7ed6", ancla="middle")
 
 # ECS como plano de control de todo
