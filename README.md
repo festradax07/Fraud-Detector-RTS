@@ -83,6 +83,10 @@ admisión y el slack no puedan contradecirse.
 
 ## Arquitectura
 
+> El recorrido completo de una transacción, paso por paso, y **dónde y cómo
+> se evalúa el tiempo real** en cada módulo:
+> [FLUJO-DEL-SISTEMA.md](FLUJO-DEL-SISTEMA.md).
+
 El sistema se lee en tres capas, en el orden en que las recorre una
 transacción. Las flechas llenas son sincrónicas (cuentan contra el deadline);
 las punteadas son asíncronas (no lo tocan).

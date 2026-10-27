@@ -347,8 +347,11 @@ a 4 no cambian ([ADR-0019](../docs/adr/0019-kafka-como-columna-de-eventos.md)).
 ## Qué comparar entre entornos
 
 El objetivo de la evaluación es el **mismo sistema** (la misma imagen) en
-binarios nativos, Docker Compose y AWS, con la misma carga. Estas son las
-métricas que se registran en cada corrida:
+binarios nativos, Docker Compose y AWS, con la misma carga. Las métricas
+**oficiales** y sus objetivos (SLI y SLO) están definidos en
+[ADR-0028](../docs/adr/0028-metricas-de-evaluacion-sli-slo-sla.md); esta tabla
+suma las de diagnóstico que explican los resultados. En cada corrida se
+registran:
 
 | # | Métrica | De dónde sale | Por qué importa | Qué esperar en AWS |
 |---|---|---|---|---|
