@@ -53,6 +53,9 @@ flowchart LR
 | **Kafka + consumidores** | Auditoría, alertas, estadísticas en vivo | **frío** (sin deadline) | [cmd/eventos](cmd/eventos/main.go) |
 | **Prometheus + Grafana** | Métricas y dashboard | fuera del flujo | [observabilidad/](observabilidad/) |
 
+Por qué se eligió cada herramienta (gRPC y no REST, Redis, Kafka, etc.):
+[sección 12](#12-por-qué-cada-herramienta).
+
 **Camino caliente** (*hot path*): todo lo que pasa entre que llega la
 transacción y sale la respuesta. Tiene que entrar en los 200ms.
 **Camino frío** (*cold path*): lo que pasa después, sin plazo. Nunca puede
@@ -491,6 +494,248 @@ objetivo de la evaluación.
   latencia de referencia es la del cliente.
 
 ---
+
+## 12. Por qué cada herramienta
+
+Cada herramienta resuelve un problema concreto del sistema. Lo que sigue
+es el porqué de cada una, contra qué alternativas se eligió y qué cuesta.
+Las decisiones completas están en los ADRs enlazados.
+
+| Herramienta | Para qué | Por qué esta y no otra (en una línea) |
+|---|---|---|
+| **Go** | todos los servicios | goroutines baratas, `context` con deadline en la biblioteca estándar, binarios estáticos |
+| **gRPC** | las llamadas del camino caliente | **propaga el deadline solo**, contrato tipado, HTTP/2 |
+| **Protocol Buffers** | contrato y eventos | un solo esquema tipado para llamadas y eventos, compacto |
+| **Redis** | el estado del camino caliente | microsegundos, estructuras de datos que calzan con cada regla, TTL y atomicidad; **estado compartido** entre réplicas |
+| **Lua (en Redis)** | el registro de Settlement | "fijarse y escribir" atómico en un solo viaje |
+| **Kafka** | el camino frío | log durable con *replay* y consumidores independientes, sin tocar el camino caliente |
+| **Prometheus + Grafana** | observabilidad | resolución de 1s, histogramas, lo mismo en todos los entornos |
+| **Docker (distroless) + Compose** | empaquetar y correr | el mismo artefacto en todos lados; Compose arma el sistema completo en una máquina |
+| **ECS, ALB, Terraform** (AWS, propuesta) | la nube | ver [la arquitectura en AWS](README.md#en-la-nube-aws-propuesta) |
+
+### Go
+
+- **Una goroutine por request.** Cuestan unos KB y el runtime las reparte
+  entre los núcleos: atender cientos de transacciones a la vez no requiere
+  un pool de threads.
+- **El deadline es parte del lenguaje:** `context.Context` lleva el plazo y
+  la cancelación, y lo entienden gRPC, el cliente de Redis y Kafka. Es la
+  pieza que hace posible el modelo de tiempo real en todo el sistema.
+- **Binarios estáticos:** sin dependencias del sistema, entran en imágenes
+  *distroless* de pocos MB.
+- **Lo que cuesta:** tiene *garbage collector*, con pausas. Se miden
+  (dashboard, fila 4): con Go actual son de pocos milisegundos. Un sistema de
+  tiempo real duro clásico usaría un lenguaje sin GC (C, Rust); acá la
+  garantía es estadística (ADR-0028) y las pausas medidas entran en el
+  margen.
+
+### gRPC, y no HTTP/REST con JSON
+
+[ADR-0002](docs/adr/0002-camino-de-decision-sincronico-con-grpc.md)
+
+| | gRPC | REST + JSON |
+|---|---|---|
+| **Deadline** | viaja solo en `grpc-timeout` y llega al servidor como `ctx` | no hay estándar: habría que inventar un header y respetarlo a mano en cada salto |
+| **Contrato** | el `.proto` genera el código de cliente y servidor: un campo mal escrito no compila | un documento aparte (OpenAPI) que se puede desincronizar del código |
+| **Formato** | binario (protobuf), más chico y rápido de serializar | texto (JSON) |
+| **Conexión** | HTTP/2: muchas requests concurrentes por una sola conexión | HTTP/1.1: una request por conexión a la vez (o un pool de conexiones) |
+| **Errores** | códigos estándar + detalles tipados (`ErrorInfo`, de donde salen los motivos como `EARLY_DROP`) | códigos HTTP + un cuerpo de error a definir |
+| **Salud** | protocolo estándar (`grpc.health.v1`), que entienden Compose, ECS, el ALB y Kubernetes | `/health` a definir |
+| **Metadatos al final** | *trailers*: Settlement informa su $C_{settle}$ ahí | no hay equivalente simple |
+
+**Lo decisivo es la primera fila:** un sistema de tiempo real necesita que
+el plazo llegue a cada salto, y gRPC lo hace sin código propio.
+
+**Lo que cuesta:**
+- **Los navegadores no hablan gRPC nativo:** la demo con QR necesita un
+  gateway HTTP → gRPC.
+- **Con un balanceador de conexiones (capa 4)**, todo va a una réplica,
+  porque HTTP/2 mantiene una sola conexión. Hace falta un balanceador por
+  request (ALB) o balanceo del lado del cliente.
+- **Depurar a mano** requiere herramientas propias (`grpcurl`) en vez de
+  `curl`.
+
+### Protocol Buffers
+
+[ADR-0024](docs/adr/0024-eventos-en-protobuf-sin-bloquear.md)
+
+- **Un solo lenguaje de esquema** para las llamadas gRPC y para los eventos
+  de Kafka: los eventos **reusan** los mensajes del contrato
+  (`EvaluationResponse`, `TxStatus`), así que no hay dos definiciones que se
+  desincronicen.
+- **Tipado y evolución con reglas:** los campos tienen número, se agregan
+  sin romper a los consumidores viejos, y un número nunca se reusa.
+- **Frente a JSON:** más compacto y sin errores de tipos en tiempo de
+  ejecución. El costo: no se lee a simple vista (por eso existe `make volcar`,
+  que convierte los eventos a JSON).
+
+### Redis, y por qué hace posible escalar el motor
+
+[ADR-0008](docs/adr/0008-redis-un-viaje-atomico.md)
+
+**Por qué Redis:**
+- **Está en memoria:** un viaje con todos los comandos de la mandatoria
+  tarda microsegundos (medido: P50 27µs), contra un presupuesto de 20ms.
+- **Sus estructuras de datos calzan con cada regla:**
+
+  | Regla | Estructura | Por qué |
+  |---|---|---|
+  | Blacklist | SET | `SISMEMBER` es O(1) |
+  | Velocidad (*card testing*) | ZSET por tarjeta | una ventana deslizante: se borran los intentos de hace más de 10s y se cuentan los que quedan |
+  | Viaje imposible | STRING con TTL | la última posición confiable, que vence sola |
+  | Estadísticas del scoring | HASH por categoría | media, desvío y peso juntos |
+  | Registro de Settlement | HASH con TTL de 24h | vive mientras se pueda reintentar |
+
+- **TTL nativo:** las claves vencen solas, sin procesos de limpieza.
+- **Atomicidad:** un pipeline transaccional (`MULTI/EXEC`) y los scripts Lua
+  se ejecutan sin que se intercalen otros clientes.
+
+**El punto clave: el motor no guarda estado.** Todo el estado de la
+detección (intentos, posiciones, blacklist, estadísticas, registros) vive en
+Redis, y **todas las réplicas del Fraud-Engine leen y escriben el mismo
+Redis**. Eso es lo que permite el escalado horizontal:
+
+```
+        ALB (reparte cada request a cualquier réplica)
+       ┌──────────┼──────────┐
+   motor 1     motor 2     motor 3      ← sin estado: cualquiera puede atender cualquier transacción
+       └──────────┼──────────┘
+                Redis                    ← el estado, compartido
+```
+
+**Cómo estaba, y por qué cambió.** En la Etapa 2, la fase mandatoria
+guardaba los intentos y las posiciones **en memoria**, en un `map` con un
+`sync.Mutex`. Con una sola instancia funciona. Con dos réplicas detrás de un
+balanceador, se rompe la detección:
+
+```
+tarjeta X: 4 intentos en 10s  (debería dar CARD_TESTING: más de 3)
+   intento 1 → motor 1     motor 1 ve 2 intentos → aprueba
+   intento 2 → motor 2     motor 2 ve 2 intentos → aprueba
+   intento 3 → motor 1
+   intento 4 → motor 2     el fraude pasa sin que nadie lo vea
+```
+
+Lo mismo con el viaje imposible: la compra en Buenos Aires la ve una réplica
+y la de Tokio, otra. Con el estado en Redis, todas ven lo mismo, y
+**agregar réplicas no cambia las decisiones**: es lo que hace correcto el
+auto scaling.
+
+**Lo que cuesta:**
+- **Redis pasa a ser el punto compartido.** Si se cae, nadie puede decidir
+  (fail-closed). Un solo Redis atiende del orden de decenas a cientos de
+  miles de operaciones por segundo. Cada transacción hace unas 10 (un
+  pipeline, un `SET` y el script de Settlement), así que 800 transacciones
+  por segundo son unas 8.000 operaciones: hay margen de sobra.
+- **Para crecer más allá de un nodo** (Redis Cluster, con los datos
+  repartidos entre varios nodos), el pipeline atómico habría que
+  rediseñarlo: `MULTI/EXEC` exige que todas las claves estén en el mismo
+  nodo, y una transacción toca claves globales (la blacklist) y claves por
+  tarjeta.
+- **No es el registro durable:** si Redis se reinicia sin persistencia, se
+  pierde el estado de corto plazo (ventanas, posiciones). El registro
+  durable de lo que pasó es la auditoría, a partir de los eventos de Kafka.
+
+**Frente a las alternativas:**
+- **Una base relacional (PostgreSQL, MySQL):** es durable y consultable,
+  pero trabaja en milisegundos (disco, conexiones), y no tiene ventanas
+  deslizantes ni TTL nativos. Es la herramienta para un libro contable, no
+  para chequeos de microsegundos.
+- **Memcached:** también en memoria, pero solo clave-valor: sin ZSET, sin
+  atomicidad entre comandos, sin scripts.
+- **Estado en memoria del proceso:** el más rápido, pero no escala
+  horizontalmente (el ejemplo de arriba).
+
+### Lua, adentro de Redis
+
+[ADR-0013](docs/adr/0013-ambiguedad-del-timeout-e-idempotencia.md)
+
+No se eligió como lenguaje: es el que **trae Redis** para ejecutar lógica
+del lado del servidor. Settlement lo necesita para la regla "si el `tx_id`
+ya tiene un resultado final, gana ese; si no, escribí el nuevo". Hecha
+desde Go con dos comandos (leer y después escribir), dos reintentos
+simultáneos podrían ver "no hay nada" y escribir los dos. Redis ejecuta el
+script **entero sin intercalar otros clientes**: el chequeo y la escritura
+son atómicos, y viajan en una sola ida y vuelta.
+
+Por qué no las alternativas: `HSETNX` solo sabe de "no existe" (y
+`ABORTED_TIMEOUT` tiene que poder reemplazarse); `WATCH`/`MULTI` obliga a
+reintentar desde Go bajo contención (más viajes justo cuando falta tiempo);
+un lock distribuido suma viajes y riesgos. Es el uso estándar de Lua en
+Redis: claves de idempotencia, *rate limiters*, liberar locks.
+
+### Kafka para el camino asíncrono
+
+[ADR-0019](docs/adr/0019-kafka-como-columna-de-eventos.md),
+[ADR-0024](docs/adr/0024-eventos-en-protobuf-sin-bloquear.md),
+[ADR-0025](docs/adr/0025-consumidores-y-auditoria.md)
+
+**Para qué:** que lo que **no** tiene que pasar dentro de los 200ms
+(auditar, alertar, recalcular estadísticas) pase en otro lado, a su ritmo,
+sin frenar ni una respuesta.
+
+**Por qué Kafka:**
+- **Es un log durable, no una cola que se vacía:** los eventos quedan 7 días
+  y se pueden volver a leer desde el principio (*replay*). Si la auditoría
+  se cae, al volver retoma donde quedó; si se agrega un consumidor nuevo,
+  puede procesar la historia.
+- **Consumidores independientes** (*consumer groups*): auditoría, alertas y
+  estadísticas leen los mismos eventos, cada uno a su ritmo, y se agregan
+  sin tocar a los productores.
+- **Orden por clave:** los eventos de una misma tarjeta van a la misma
+  partición y llegan en orden.
+- **Es el estándar de la industria** como columna de eventos en sistemas de
+  pagos.
+
+**Por qué no en el camino de decisión:** el mensaje no lleva el deadline,
+las pausas de *rebalance* de los consumidores frenan segundos, y la
+respuesta volvería por otro topic: se perdería la garantía de que en 200ms
+el cliente sabe el resultado (o sabe que no lo sabe).
+
+**Cómo se protege el camino caliente:** publicar **nunca bloquea**
+(`TryProduce` con un buffer acotado; si se llena, el evento se descarta y se
+cuenta). Medido: con Kafka caído, las decisiones dan igual.
+
+**Frente a las alternativas:**
+- **RabbitMQ:** una cola clásica, donde el mensaje se borra al consumirse;
+  repetir la historia o sumar consumidores independientes es más
+  incómodo.
+- **Redis Streams:** existe, pero cargaría el camino frío **sobre el mismo
+  Redis que usa el camino caliente**. Separarlos es justamente la idea.
+- **NATS JetStream:** más liviano, una alternativa razonable; Kafka es más
+  común en pagos y en el mercado.
+- **Lo que cuesta Kafka:** es pesado de operar (JVM, memoria, disco). Por eso
+  va en su propia instancia y su caída no afecta las decisiones.
+
+### Prometheus y Grafana
+
+[ADR-0015](docs/adr/0015-observabilidad-prometheus-grafana.md)
+
+- **Prometheus lee (*scrapea*) cada 1 segundo** las métricas que expone cada
+  servicio en `/metrics`: una corrida de 24 minutos tiene 1.440 puntos por
+  métrica, no 24 (como con una resolución de 1 minuto).
+- **Histogramas con límites en los umbrales del diseño** (35, 95 y 200ms) y
+  consultas con PromQL (percentiles, tasas, proporciones).
+- **Grafana con el dashboard como código:** se carga desde un archivo
+  versionado, así que el mismo dashboard aparece en todos los entornos sin
+  configurar nada.
+- **El mismo stack en la notebook, en Compose y en AWS:** la observabilidad
+  también es parte del "mismo artefacto" que se compara. En AWS se suma
+  CloudWatch para la infraestructura, como segunda fuente de Grafana.
+
+### Docker con imágenes *distroless*, y Docker Compose
+
+[ADR-0020](docs/adr/0020-imagenes-salud-y-compose.md),
+[ADR-0023](docs/adr/0023-redes-como-subredes-privadas.md)
+
+- **El mismo artefacto en todos lados:** la imagen que corre en Compose es
+  la que va a correr en AWS. Si cambiara entre entornos, una diferencia de
+  latencia podría venir de la imagen y no del entorno.
+- **Distroless:** solo el binario, sin shell ni gestor de paquetes, con un
+  usuario sin privilegios. Menos superficie de ataque, y entra en pocos MB.
+- **Compose** levanta el sistema completo en una máquina, con un orden de
+  arranque dado por los chequeos de salud y con **redes separadas que
+  imitan las subredes de una VPC** (el mismo diseño que en AWS).
 
 ## Anexo: el código del tiempo real
 
