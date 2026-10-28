@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>D-RTS · Comprá</title>
+<style>
+  :root { --fondo:#f6f7f9; --carta:#fff; --texto:#1d2330; --suave:#5b6474; --ok:#2b8a3e; --no:#c92a2a; --warn:#e67700; --acento:#5f3dc4; --borde:#e3e6ec; }
+  @media (prefers-color-scheme: dark) { :root { --fondo:#12141a; --carta:#1b1f28; --texto:#e8eaf0; --suave:#9aa3b5; --borde:#2a303c; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background:var(--fondo); color:var(--texto); }
+  main { max-width: 520px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 1.35rem; margin: 4px 0 2px; }
+  .sub { color: var(--suave); font-size: .92rem; margin: 0 0 14px; }
+  .botones { display: grid; gap: 10px; }
+  button { font: inherit; font-size: 1.02rem; text-align: left; padding: 14px 16px; border-radius: 14px; border: 1px solid var(--borde); background: var(--carta); color: var(--texto); cursor: pointer; }
+  button b { display:block; }
+  button span { color: var(--suave); font-size: .86rem; }
+  button.principal { background: var(--acento); color: #fff; border-color: var(--acento); }
+  button.principal span { color: #e5dbff; }
+  button:disabled { opacity: .55; }
+  h2 { font-size: 1rem; margin: 22px 0 8px; }
+  .tx { background: var(--carta); border: 1px solid var(--borde); border-left: 6px solid var(--suave); border-radius: 12px; padding: 10px 12px; margin-bottom: 8px; }
+  .tx.aprobada { border-left-color: var(--ok); } .tx.rechazada { border-left-color: var(--no); } .tx.error { border-left-color: var(--warn); }
+  .tx .titulo { font-weight: 650; }
+  .tx .det { color: var(--suave); font-size: .86rem; margin-top: 3px; }
+  .chip { display:inline-block; font-size:.75rem; padding: 1px 7px; border-radius: 999px; background: #fff3bf; color:#5c3c00; margin-left:4px; }
+  .tiempos { background: var(--carta); border: 1px solid var(--borde); border-radius: 12px; padding: 12px; margin-top: 4px; font-size: .92rem; }
+  .barra { height: 10px; background: var(--borde); border-radius: 999px; overflow: hidden; margin: 6px 0 2px; position: relative; }
+  .barra i { display:block; height:100%; background: var(--ok); }
+  .barra.tarde i { background: var(--no); }
+  .pie { color: var(--suave); font-size: .8rem; margin-top: 18px; }
+  .desglose { display:flex; height: 16px; border-radius: 999px; overflow: hidden; margin: 8px 0 6px; background: var(--borde); }
+  .desglose i { display:block; height:100%; }
+  .c-internet { background:#845ef7; } .c-espera { background:#f08c00; } .c-motor { background:#2f9e44; }
+  .leyenda { display:grid; grid-template-columns: auto 1fr auto; gap: 3px 8px; font-size: .86rem; align-items:center; }
+  .leyenda .pto { width:10px; height:10px; border-radius: 3px; }
+  .leyenda .v { text-align:right; font-variant-numeric: tabular-nums; }
+  .historial { background: var(--carta); border: 1px solid var(--borde); border-radius: 12px; padding: 10px 12px; margin-top: 10px; }
+  .fila { display:grid; grid-template-columns: 54px 1fr 64px; gap: 8px; align-items:center; font-size: .8rem; margin: 3px 0; }
+  .pista { position: relative; height: 10px; background: var(--borde); border-radius: 999px; overflow: hidden; }
+  .pista i { position:absolute; left:0; top:0; bottom:0; border-radius: 999px; background: var(--ok); }
+  .pista i.tarde { background: var(--no); } .pista i.medio { background: var(--warn); }
+  .pista .linea { position:absolute; top:-2px; bottom:-2px; width:2px; background: var(--texto); opacity:.5; }
+  .fila .v { text-align:right; font-variant-numeric: tabular-nums; }
+  .tarjeta { position: relative; border-radius: 16px; padding: 16px 18px; margin: 4px 0 10px; color: #fff; background: linear-gradient(135deg, #5f3dc4, #1c7ed6); box-shadow: 0 6px 18px rgba(0,0,0,.18); overflow: hidden; }
+  .tarjeta .marca { font-size: .78rem; opacity: .85; letter-spacing: .04em; }
+  .tarjeta .numero { font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; font-size: 1.32rem; letter-spacing: .08em; margin: 14px 0 10px; }
+  .tarjeta .estado { font-size: .85rem; font-weight: 650; }
+  .tarjeta.revision { background: linear-gradient(135deg, #e67700, #f08c00); }
+  .tarjeta.bloqueada { background: linear-gradient(135deg, #495057, #343a40); }
+  .tarjeta.bloqueada::after { content: "BLOQUEADA"; position: absolute; right: -36px; top: 22px; transform: rotate(35deg); background: #c92a2a; color: #fff; font-weight: 800; font-size: .8rem; padding: 4px 44px; letter-spacing: .1em; }
+  .aviso { border-radius: 12px; padding: 10px 12px; margin: 8px 0; font-size: .9rem; border: 1px solid var(--borde); background: var(--carta); }
+  .aviso.malo { border-color: #ffa8a8; background: #fff5f5; color: #862e2e; }
+  .aviso.medio { border-color: #ffd8a8; background: #fff9db; color: #7a4a00; }
+  @media (prefers-color-scheme: dark) { .aviso.malo { background:#2c1b1b; color:#ffc9c9; border-color:#5c2b2b; } .aviso.medio { background:#2b2414; color:#ffe8a3; border-color:#5c4a1b; } }
+  #nuevaTarjeta { width: 100%; text-align: center; margin-bottom: 14px; }
+  #repetir { margin-top: 10px; width: 100%; text-align:center; background: var(--acento); color:#fff; border-color: var(--acento); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Pagá con tu celular</h1>
+  <p class="sub">Cada compra la decide el motor antifraude en <b>menos de 200 ms</b>. Probá una normal y después intentá engañarlo.</p>
+
+  <div class="tarjeta" id="tarjeta">
+    <div class="marca">D-RTS · TARJETA DE PRUEBA (no es real)</div>
+    <div class="numero" id="numero">DRTS •••• •••• ••••</div>
+    <div class="estado" id="estadoTarjeta">● Activa</div>
+  </div>
+  <div id="avisoTarjeta"></div>
+  <button id="nuevaTarjeta" hidden>💳 Pedir una tarjeta nueva</button>
+
+  <div class="botones">
+    <button class="principal" data-esc="normal"><b>🛒 Compra normal</b><span>Una compra común con tu tarjeta</span></button>
+    <button data-esc="card_testing"><b>🔁 Probar tu tarjeta 4 veces seguidas</b><span>Card testing: así se prueba una tarjeta robada</span></button>
+    <button data-esc="viaje_imposible"><b>✈️ Comprar en Buenos Aires y en Tokio</b><span>Viaje imposible: tu tarjeta en dos lugares a la vez</span></button>
+    <button data-esc="tarjeta_robada"><b>🚨 Usar una tarjeta robada</b><span>La de otra persona, que ya está en la lista negra</span></button>
+    <button data-esc="monto_anormal"><b>💸 $25.000 en el súper</b><span>Un monto fuera de lo normal para ese comercio</span></button>
+  </div>
+
+  <h2 id="tituloRes" hidden>Resultado</h2>
+  <div id="resultados"></div>
+  <div id="tiempos"></div>
+  <button id="repetir" hidden>🔄 Repetir esta compra</button>
+
+  <div class="historial" id="historial" hidden>
+    <b>Tus compras</b> <span style="color:var(--suave);font-size:.82rem">(tiempo del sistema; la raya es el deadline de 200 ms)</span>
+    <div id="filas"></div>
+  </div>
+
+  <p class="pie">Datos simulados: no se usa ninguna tarjeta real. D-RTS · Sistemas en Tiempo Real.</p>
+</main>
+<script>
+  const token = new URLSearchParams(location.search).get("t") || "";
+
+  // Una "tarjeta" por celular, que se mantiene mientras dure la clase.
+  function nuevaSesion() {
+    const a = new Uint8Array(12); crypto.getRandomValues(a);
+    return Array.from(a, b => (b % 36).toString(36)).join("");
+  }
+  let sesion;
+  try { sesion = localStorage.getItem("drts-sesion") || nuevaSesion(); localStorage.setItem("drts-sesion", sesion); }
+  catch { sesion = nuevaSesion(); }
+
+  const textos = {
+    BLACKLIST: "Tarjeta bloqueada (está en la lista negra)",
+    CARD_TESTING: "Card testing: más de 3 intentos en 10 segundos",
+    VIAJE_IMPOSIBLE: "Viaje imposible: más de 800 km/h desde la compra anterior",
+    RIESGO_ALTO: "Riesgo alto: el monto no es normal para el comercio",
+    EARLY_DROP: "Rechazada al llegar: no quedaba tiempo para decidir",
+    DEADLINE_MISS: "Sin respuesta en 200 ms: el sistema está saturado",
+    SETTLEMENT_TIMEOUT: "Resultado incierto: no se confirmó a tiempo",
+    SETTLEMENT_NO_DISPONIBLE: "Resultado incierto: el registro no respondió",
+  };
+  const iconos = { aprobada: "✅", rechazada: "⛔", error: "⚠️" };
+
+  // La tarjeta del celular: un número de fantasía, único por celular y por
+  // tarjeta (si la bloquean, se pide otra). El sistema la conoce como
+  // "qr-<sesión>-t<número>".
+  let tarjeta = 0;
+  try { tarjeta = parseInt(localStorage.getItem("drts-tarjeta") || "0", 10) || 0; } catch {}
+  // El número lo calcula el servidor: así es el mismo que aparece en el
+  // dashboard de la demo.
+  async function numeroDeTarjeta() {
+    try {
+      const r = await fetch(`/api/tarjeta?t=${encodeURIComponent(token)}&sesion=${sesion}&tarjeta=${tarjeta}`);
+      if (r.ok) return (await r.json()).numero;
+    } catch {}
+    return "DRTS •••• •••• ••••";
+  }
+  function estadoTarjeta(estado, aviso, clase) {
+    const t = document.getElementById("tarjeta");
+    t.className = "tarjeta " + estado;
+    document.getElementById("estadoTarjeta").textContent =
+      estado === "bloqueada" ? "● Bloqueada por fraude" : estado === "revision" ? "● En revisión: fraude detectado" : "● Activa";
+    document.getElementById("avisoTarjeta").innerHTML = aviso ? `<div class="aviso ${clase || ""}">${aviso}</div>` : "";
+    document.getElementById("nuevaTarjeta").hidden = estado === "activa";
+    try { localStorage.setItem("drts-estado-" + tarjeta, estado); } catch {}
+  }
+  async function mostrarTarjeta() {
+    document.getElementById("numero").textContent = await numeroDeTarjeta();
+    let estado = "activa";
+    try { estado = localStorage.getItem("drts-estado-" + tarjeta) || "activa"; } catch {}
+    estadoTarjeta(estado);
+  }
+  document.getElementById("nuevaTarjeta").addEventListener("click", async () => {
+    tarjeta++;
+    try { localStorage.setItem("drts-tarjeta", String(tarjeta)); } catch {}
+    await mostrarTarjeta();
+    document.getElementById("avisoTarjeta").innerHTML = `<div class="aviso">Te llegó una tarjeta nueva: <b>${document.getElementById("numero").textContent}</b>. La anterior queda bloqueada. Buscala en el dashboard de la demo.</div>`;
+  });
+  const ms = x => x.toFixed(x < 10 ? 1 : 0) + " ms";
+  const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+  async function comprar(escenario) {
+    document.querySelectorAll("button").forEach(b => b.disabled = true);
+    const cont = document.getElementById("resultados");
+    const tiempos = document.getElementById("tiempos");
+    document.getElementById("tituloRes").hidden = false;
+    cont.innerHTML = "<div class='tx'>Procesando…</div>"; tiempos.innerHTML = "";
+    const t0 = performance.now();
+    try {
+      const r = await fetch("/api/compra?t=" + encodeURIComponent(token), {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sesion, escenario, tarjeta }),
+      });
+      const total = performance.now() - t0;
+      if (!r.ok) { cont.innerHTML = "<div class='tx error'>" + esc(await r.text()) + "</div>"; return; }
+      const data = await r.json();
+      const deadline = data.deadline_ms;
+      let sistema = 0;
+      cont.innerHTML = data.resultados.map(x => {
+        sistema += x.sistema_ms;
+        const motivo = x.motivo ? (textos[x.motivo] || x.motivo) : (x.decision === "aprobada" ? "Aprobada" : "");
+        const deg = x.degradada ? "<span class='chip'>degradada: sin scoring</span>" : "";
+        return `<div class="tx ${x.decision}"><div class="titulo">${iconos[x.decision] || ""} ${esc(x.descripcion)}</div>
+          <div class="det">${esc(motivo)}${deg} · sistema: <b>${ms(x.sistema_ms)}</b></div></div>`;
+      }).join("");
+      // Desglose del tiempo total que vio el celular:
+      //   internet = total - lo que pasó dentro del servidor
+      //   motor    = lo que el motor informa que tardó procesando
+      //   espera   = el resto del sistema: red interna, gRPC y la cola de
+      //              CPU antes de que el motor empiece (crece con la carga)
+      const servidor = data.servidor_ms;
+      const motor = data.resultados.reduce((a, x) => a + x.motor_ms, 0);
+      const internet = Math.max(0, total - servidor);
+      const espera = Math.max(0, servidor - motor);
+      const peor = Math.max(...data.resultados.map(x => x.sistema_ms));
+      const base = Math.max(total, servidor, 1); // nunca dividir por 0
+      const pct = x => (100 * x / base).toFixed(1) + "%";
+      tiempos.innerHTML = `
+        <div class="tiempos">
+          <div><b>¿Dónde se fueron los ${ms(total)}?</b></div>
+          <div class="desglose"><i class="c-internet" style="width:${pct(internet)}"></i><i class="c-espera" style="width:${pct(espera)}"></i><i class="c-motor" style="width:${pct(motor)}"></i></div>
+          <div class="leyenda">
+            <span class="pto c-internet"></span><span>Tu internet, ida y vuelta (fuera del deadline)</span><span class="v">${ms(internet)}</span>
+            <span class="pto c-espera"></span><span>Red interna y espera en el sistema</span><span class="v">${ms(espera)}</span>
+            <span class="pto c-motor"></span><span>El motor decidiendo</span><span class="v">${ms(motor)}</span>
+          </div>
+          <div style="margin-top:10px"><b>Contra el deadline:</b> la más lenta tardó ${ms(peor)} de ${deadline} ms</div>
+          <div class="barra ${peor > deadline ? "tarde" : ""}"><i style="width:${Math.min(100, 100 * peor / deadline)}%"></i></div>
+          <div style="color:var(--suave);font-size:.8rem;margin-top:4px">Los 200 ms se cuentan desde que la compra entra al sistema, como en una pasarela de pagos real.</div>
+        </div>`;
+      ultimo = escenario;
+      document.getElementById("repetir").hidden = false;
+
+      // ¿Qué le pasó a TU tarjeta? (la robada es de otra persona)
+      const motivos = data.resultados.map(x => x.motivo);
+      if (escenario !== "tarjeta_robada" && motivos.includes("BLACKLIST")) {
+        estadoTarjeta("bloqueada", "🔒 <b>Tu tarjeta está bloqueada.</b> El sistema aprendió que tuvo fraude y la puso en la lista negra: ya no se puede usar. Pedí una nueva.", "malo");
+      } else if (motivos.includes("CARD_TESTING") || motivos.includes("VIAJE_IMPOSIBLE")) {
+        estadoTarjeta("revision", "🚩 <b>Fraude detectado con tu tarjeta.</b> El motor rechazó la compra en milisegundos. El bloqueo lo hace después el camino frío: la alerta viaja por Kafka y un consumidor agrega la tarjeta a la lista negra. Probá comprar de nuevo.", "medio");
+      } else if (motivos.includes("RIESGO_ALTO")) {
+        document.getElementById("avisoTarjeta").innerHTML = `<div class="aviso medio">El monto no es normal y la compra se rechazó, pero <b>tu tarjeta sigue activa</b>: podría ser una compra legítima. En la vida real te preguntarían "¿fuiste vos?".</div>`;
+      }
+      agregarAlHistorial(peor, data.resultados.some(x => x.decision === "error"), deadline);
+    } catch (e) {
+      cont.innerHTML = "<div class='tx error'>No hubo respuesta. Probá de nuevo.</div>";
+    } finally {
+      document.querySelectorAll("button").forEach(b => b.disabled = false);
+    }
+  }
+  document.querySelectorAll("button[data-esc]").forEach(b => b.addEventListener("click", () => comprar(b.dataset.esc)));
+  mostrarTarjeta();
+
+  // Repetir la última compra: para ver si el sistema mejora o empeora.
+  let ultimo = null;
+  document.getElementById("repetir").addEventListener("click", () => ultimo && comprar(ultimo));
+
+  // Historial: las últimas compras de este celular, contra el deadline.
+  const historial = [];
+  function agregarAlHistorial(peorMs, huboError, deadline) {
+    historial.unshift({ hora: new Date(), ms: peorMs, error: huboError });
+    historial.length = Math.min(historial.length, 12);
+    const escala = Math.max(250, ...historial.map(h => h.ms));
+    document.getElementById("historial").hidden = false;
+    document.getElementById("filas").innerHTML = historial.map(h => {
+      const clase = h.error || h.ms > deadline ? "tarde" : (h.ms > deadline / 2 ? "medio" : "");
+      const hora = h.hora.toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });
+      return `<div class="fila"><span>${hora}</span>
+        <div class="pista"><i class="${clase}" style="width:${Math.min(100, 100 * h.ms / escala)}%"></i><span class="linea" style="left:${100 * deadline / escala}%"></span></div>
+        <span class="v">${h.error ? "⚠️ " : ""}${ms(h.ms)}</span></div>`;
+    }).join("");
+  }
+</script>
+</body>
+</html>

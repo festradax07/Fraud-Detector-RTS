@@ -79,7 +79,7 @@ services:
     networks: [datos]
     build: { <<: *build, target: cargar-stats }
     image: drts/cargar-stats:dev
-    command: ["-csv", "/app/data/fraudTrain.csv", "-redis", "redis:6379"]
+    command: ["-csv", "/app/data/fraudTrain.csv", "-redis", "redis:6379", "-blacklist", "demo-robada"]
     volumes:
       - ./data:/app/data:ro # el dataset NO va en la imagen
     depends_on:
@@ -222,7 +222,12 @@ services:
     image: drts/eventos:dev
     pull_policy: never # la imagen la construye eventos-auditoria; no buscarla en Docker Hub
     command: ["-rol", "alertas"]
-    environment: { KAFKA_BROKERS: "kafka:29092" }
+    environment:
+      KAFKA_BROKERS: "kafka:29092"
+      REDIS_ADDR: "redis:6379"
+      # Bloqueo automático (ADR-0029): estos fraudes bloquean la tarjeta. El
+      # loadgen usa una tarjeta por transacción, así que no afecta mediciones.
+      BLOQUEO_AUTOMATICO: "CARD_TESTING,VIAJE_IMPOSIBLE"
     networks: [aplicacion, datos]
     depends_on:
       kafka-topics: { condition: service_completed_successfully }
@@ -259,6 +264,27 @@ services:
       - ./data:/app/data:ro
       - ./perfiles:/app/perfiles:ro # curvas de carga del día (-perfil, ADR-0026)
       - ./resultados:/app/resultados
+    depends_on:
+      fraud-engine: { condition: service_healthy }
+
+  # ------------------------------------------------------------------ demo
+  # Gateway de la demo con QR: recibe compras de los celulares por HTTP y las
+  # manda al motor por gRPC, poniendo el deadline de 200ms en el borde.
+  # Escucha en TODAS las interfaces (no solo localhost) para que los
+  # celulares de la red puedan entrar: por eso va en su propio perfil y exige
+  # un token. Uso: make demo-up, y abrir /presentador?t=<DEMO_TOKEN>.
+  gateway:
+    logging: *logging
+    profiles: [demo]
+    networks: [aplicacion]
+    build: { <<: *build, target: gateway }
+    image: drts/gateway:dev
+    pull_policy: never
+    environment:
+      MOTOR_ADDR: fraud-engine:50051
+      DEMO_TOKEN: ${DEMO_TOKEN:-demo-local}
+    ports:
+      - "${DEMO_PUERTO:-8080}:8080"
     depends_on:
       fraud-engine: { condition: service_healthy }
 

@@ -1,4 +1,4 @@
-.PHONY: build run-server run-settlement cargar-stats carga-nominal carga-sobrecarga obs-up obs-down kafka-up kafka-down volcar sistema-up sistema-down imagenes carga-compose limpiar-carga proto clean
+.PHONY: build run-server run-settlement cargar-stats carga-nominal carga-sobrecarga obs-up obs-down kafka-up kafka-down volcar sistema-up sistema-down demo-up demo-cpu demo-carga imagenes carga-compose limpiar-carga proto clean
 
 build:
 	go build ./...
@@ -44,9 +44,32 @@ volcar:
 sistema-up:
 	docker compose --profile sistema up -d --build
 
-# Baja todo (sistema, carga y observabilidad).
+# Demo con QR: el sistema completo más el gateway. Abrir en el navegador
+# http://localhost:8080/presentador?t=demo-local (o el DEMO_TOKEN elegido).
+demo-up:
+	docker compose --profile sistema --profile demo up -d --build
+
+# Cambia en vivo cuántos núcleos puede usar el motor, sin reiniciarlo
+# (escalado VERTICAL: más CPU a la misma máquina). En la demo: arrancar con 1,
+# saturarlo con demo-carga, y subir a 4 para que la latencia baje.
+# Ejemplo: make demo-cpu CPUS=1
+CPUS ?= 4
+demo-cpu:
+	docker update --cpus=$(CPUS) drts-fraud-engine-1
+
+# Carga de fondo para la demo (tasa fija). Con el motor en 1 núcleo
+# (~45 transacciones por segundo), 55 RPS lo deja al borde: unas compras salen
+# bien y otras se pasan de los 200ms. Con 62+ casi todo falla. Recalibrar en
+# cada máquina (un núcleo de AWS no es el de la notebook).
+# Ejemplo: make demo-carga RPS=70 DURACION=3m
+RPS ?= 55
+DURACION ?= 3m
+demo-carga:
+	docker compose --profile sistema --profile carga run --rm --use-aliases loadgen -rps $(RPS) -duracion $(DURACION) -gracia 0
+
+# Baja todo (sistema, carga, demo y observabilidad).
 sistema-down:
-	docker compose --profile sistema --profile carga --profile kafka down
+	docker compose --profile sistema --profile carga --profile kafka --profile demo down
 
 # Construye las imágenes sin levantar nada.
 imagenes:
@@ -81,4 +104,4 @@ proto:
 		proto/transactions.proto proto/eventos.proto
 
 clean:
-	rm -f server settlement loadgen eventos cargar-stats salud
+	rm -f server settlement loadgen eventos cargar-stats salud gateway

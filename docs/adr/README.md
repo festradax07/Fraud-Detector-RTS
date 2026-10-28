@@ -47,6 +47,7 @@ escriben: [ADR-0001](0001-registrar-decisiones-con-adrs.md) y la
 | [0026](0026-perfil-de-carga-diario.md) | Perfil de carga diario (Poisson no homogéneo) | Aceptada | 6 (extiende el load generator) |
 | [0027](0027-reintento-responde-lo-registrado.md) | Un reintento responde lo registrado; sin registro no hay decisión | Aceptada (reemplaza parte de 0012) | corrección posterior a la 8 |
 | [0028](0028-metricas-de-evaluacion-sli-slo-sla.md) | Métricas de evaluación y objetivos (SLI, SLO y SLA) | Aceptada | transversal (evaluación por entornos) |
+| [0029](0029-demo-interactiva-y-bloqueo-automatico.md) | Demo interactiva con QR y bloqueo automático de tarjetas | Aceptada | demo de la presentación |
 
 ## Cómo leerlos
 

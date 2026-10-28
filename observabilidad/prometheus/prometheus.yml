@@ -28,6 +28,12 @@ scrape_configs:
     static_configs:
       - targets: ["eventos-auditoria:2115", "eventos-alertas:2115", "eventos-estadisticas:2115"]
         labels: { entorno: compose }
+  # Gateway de la demo con QR (perfil demo del Compose): métricas de las
+  # compras de la clase y de cada tarjeta, para el dashboard de la demo.
+  - job_name: gateway
+    static_configs:
+      - targets: ["gateway:2116"]
+        labels: { entorno: compose }
   - job_name: loadgen
     static_configs:
       - targets: ["host.docker.internal:2114"]

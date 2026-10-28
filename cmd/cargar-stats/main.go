@@ -23,6 +23,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"fd_rts/internal/estadisticas"
@@ -42,6 +43,7 @@ func main() {
 	rutaCSV := flag.String("csv", "data/fraudTrain.csv", "CSV de entrenamiento (dataset Sparkov)")
 	redisAddr := flag.String("redis", "localhost:6379", "dirección de Redis")
 	prefijo := flag.String("prefijo", redisclient.PrefijoPorDefecto, "prefijo de claves (el mismo que usan los servicios)")
+	blacklist := flag.String("blacklist", "", "tarjetas a bloquear, separadas por coma (por ejemplo, la tarjeta robada de la demo)")
 	flag.Parse()
 
 	if err := registro.Configurar("cargar_stats"); err != nil {
@@ -98,6 +100,19 @@ func main() {
 		fmt.Printf("%-16s %8d %9.4f %10.4f %7.3f %7.3f%%\n", c, a.N, a.Media, a.Desvio(), peso, 100*tasa)
 	}
 	fmt.Printf("cargadas %d categorías en Redis (%s, prefijo %q)\n", len(categorias), *redisAddr, *prefijo)
+
+	// La blacklist también es un dato de referencia: sin esto, en un sistema
+	// recién levantado la regla de blacklist no tiene nada contra qué
+	// comparar (solo los tests cargaban tarjetas).
+	for _, tarjeta := range strings.Split(*blacklist, ",") {
+		if tarjeta = strings.TrimSpace(tarjeta); tarjeta == "" {
+			continue
+		}
+		if err := v.Bloquear(ctx, tarjeta); err != nil {
+			registro.Fatal("no se pudo cargar la blacklist", "tarjeta", tarjeta, "error", err)
+		}
+		fmt.Printf("bloqueada %q\n", tarjeta)
+	}
 }
 
 // leerCSV recorre el CSV fila por fila (sin cargarlo entero en memoria) y

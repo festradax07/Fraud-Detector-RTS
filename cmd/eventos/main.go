@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"math"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -75,7 +76,20 @@ func main() {
 	case "auditoria":
 		err = auditar(ctx, brokers, topics, "drts-auditoria", *dir, *ventana, reg)
 	case "alertas":
-		err = alertar(ctx, brokers, topics, "drts-alertas", reg)
+		// Bloqueo automático (ADR-0029): con BLOQUEO_AUTOMATICO, los fraudes
+		// con esos motivos bloquean la tarjeta (la agregan a la blacklist).
+		var bloqueo *bloqueoAutomatico
+		if motivos := motivosDeBloqueo(config.Texto("BLOQUEO_AUTOMATICO", "")); len(motivos) > 0 {
+			rdb, errR := redisclient.Conectar(ctx, config.Texto("REDIS_ADDR", "localhost:6379"))
+			if errR != nil {
+				registro.Fatal("no se pudo conectar a Redis", "error", errR)
+			}
+			defer rdb.Close()
+			prefijo := config.Texto("REDIS_PREFIJO", redisclient.PrefijoPorDefecto)
+			bloqueo = &bloqueoAutomatico{verificador: mandatoria.NuevoVerificador(rdb, prefijo), motivos: motivos}
+			slog.Info("bloqueo automático activado", "motivos", config.Texto("BLOQUEO_AUTOMATICO", ""))
+		}
+		err = alertar(ctx, brokers, topics, "drts-alertas", bloqueo, reg)
 	case "estadisticas":
 		var rdb *redis.Client
 		if rdb, err = redisclient.Conectar(ctx, config.Texto("REDIS_ADDR", "localhost:6379")); err != nil {
@@ -179,13 +193,43 @@ func auditar(ctx context.Context, brokers []string, topics eventos.Topics, grupo
 
 // alertar cuenta y registra los fraudes por motivo. En un sistema real, acá
 // se abriría un caso en el sistema de gestión de fraude.
-func alertar(ctx context.Context, brokers []string, topics eventos.Topics, grupo string, reg prometheus.Registerer) error {
+// bloqueoAutomatico: qué motivos de fraude bloquean la tarjeta, y dónde.
+type bloqueoAutomatico struct {
+	verificador *mandatoria.Verificador
+	motivos     map[string]bool
+}
+
+// motivosDeBloqueo convierte "CARD_TESTING,VIAJE_IMPOSIBLE" en un conjunto.
+// Vacío = sin bloqueo automático.
+func motivosDeBloqueo(lista string) map[string]bool {
+	m := map[string]bool{}
+	for _, x := range strings.Split(lista, ",") {
+		if x = strings.TrimSpace(x); x != "" {
+			m[x] = true
+		}
+	}
+	return m
+}
+
+// alertar registra cada fraude detectado. Con bloqueo != nil, además bloquea
+// la tarjeta cuando el motivo es una señal fuerte (ADR-0029): lo hace el
+// camino frío, no el motor, así que el bloqueo llega unos milisegundos
+// después (eventualmente consistente), como en un sistema real.
+func alertar(ctx context.Context, brokers []string, topics eventos.Topics, grupo string, bloqueo *bloqueoAutomatico, reg prometheus.Registerer) error {
 	alertas := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "drts_alertas_total", Help: "Fraudes detectados, por motivo.",
 	}, []string{"motivo"})
-	reg.MustRegister(alertas)
+	bloqueos := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "drts_bloqueos_total", Help: "Tarjetas bloqueadas automáticamente por el camino frío, por motivo del fraude (ADR-0029).",
+	}, []string{"motivo"})
+	reg.MustRegister(alertas, bloqueos)
 	for _, m := range []string{mandatoria.MotivoBlacklist, mandatoria.MotivoCardTesting, mandatoria.MotivoViajeImposible, opcional.MotivoRiesgoAlto} {
 		alertas.WithLabelValues(m) // en 0 desde el arranque
+	}
+	if bloqueo != nil {
+		for m := range bloqueo.motivos {
+			bloqueos.WithLabelValues(m)
+		}
 	}
 
 	m := consumo.NuevasMetricas(reg, grupo)
@@ -199,6 +243,16 @@ func alertar(ctx context.Context, brokers []string, topics eventos.Topics, grupo
 			motivo := ev.Evaluacion.GetRejectionReason()
 			alertas.WithLabelValues(motivo).Inc()
 			slog.Info("alerta de fraude", "tx_id", ev.TxId, "motivo", motivo, "categoria", ev.MerchantCategory)
+			if bloqueo != nil && bloqueo.motivos[motivo] {
+				// SADD es idempotente: si el evento llega dos veces (al menos
+				// una vez), bloquear de nuevo no cambia nada. Si falla, se
+				// devuelve el error y el evento se vuelve a procesar.
+				if err := bloqueo.verificador.Bloquear(ctx, ev.CardToken); err != nil {
+					return fmt.Errorf("bloqueando %s: %w", ev.CardToken, err)
+				}
+				bloqueos.WithLabelValues(motivo).Inc()
+				slog.Info("tarjeta bloqueada", "tarjeta", ev.CardToken, "motivo", motivo, "tx_id", ev.TxId)
+			}
 		}
 		return nil
 	})

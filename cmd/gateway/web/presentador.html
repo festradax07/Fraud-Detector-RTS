@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>D-RTS · Escaneá</title>
+<style>
+  body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background:#12141a; color:#e8eaf0; }
+  main { min-height: 100vh; display:flex; align-items:center; justify-content:center; gap: 56px; padding: 24px; flex-wrap: wrap; }
+  img { width: min(70vh, 560px); background:#fff; padding: 18px; border-radius: 18px; }
+  h1 { font-size: 2.6rem; margin: 0 0 6px; }
+  p { font-size: 1.25rem; color:#b8bfcc; margin: 0 0 22px; max-width: 520px; }
+  .url { font-family: ui-monospace, monospace; font-size: 1rem; color:#9aa3b5; word-break: break-all; }
+  .conteo { display:flex; gap: 16px; margin-top: 18px; }
+  .conteo div { background:#1b1f28; border-radius: 14px; padding: 14px 18px; min-width: 130px; }
+  .conteo b { display:block; font-size: 2.4rem; }
+  .ok b { color:#69db7c; } .no b { color:#ff8787; } .err b { color:#ffd43b; }
+  .grafico { margin-top: 22px; background:#1b1f28; border-radius: 14px; padding: 12px 14px; width: min(640px, 92vw); }
+  .grafico h3 { margin: 0 0 6px; font-size: 1.05rem; font-weight: 600; color:#e8eaf0; }
+  .grafico .stats { color:#b8bfcc; font-size: .95rem; margin-bottom: 4px; }
+  .grafico .stats b { color:#fff; }
+  svg text { fill:#9aa3b5; font-size: 11px; font-family: system-ui, sans-serif; }
+</style>
+</head>
+<body>
+<main>
+  <img id="qr" alt="QR de la demo">
+  <section>
+    <h1>Escaneá y comprá</h1>
+    <p>Hacé una compra normal y después intentá engañar al motor antifraude. Cada decisión tiene que salir en menos de 200 ms.</p>
+    <div class="url" id="url"></div>
+    <div class="conteo">
+      <div class="ok"><b id="aprobada">0</b>aprobadas</div>
+      <div class="no"><b id="rechazada">0</b>fraudes detectados</div>
+      <div class="err"><b id="error">0</b>sin decisión a tiempo</div>
+    </div>
+    <div class="grafico">
+      <h3>Latencia del sistema de cada compra de la clase (último minuto)</h3>
+      <div class="stats" id="stats">Esperando compras…</div>
+      <svg id="g" viewBox="0 0 600 220" width="100%" role="img" aria-label="Latencia de las compras del último minuto"></svg>
+    </div>
+  </section>
+</main>
+<script>
+  const t = new URLSearchParams(location.search).get("t") || "";
+  const q = "?t=" + encodeURIComponent(t);
+  document.getElementById("qr").src = "/qr.png" + q;
+  document.getElementById("url").textContent = location.origin + "/" + q;
+  const colores = { aprobada: "#69db7c", rechazada: "#ff8787", error: "#ffd43b" };
+  function percentil(xs, q) {
+    if (!xs.length) return 0;
+    const o = [...xs].sort((a, b) => a - b);
+    return o[Math.min(o.length - 1, Math.ceil(q * o.length) - 1)];
+  }
+  function dibujar(recientes, ahora) {
+    // x: segundos atrás (60 → 0); y: ms (0 → techo). Línea roja: 200 ms.
+    const W = 600, H = 220, izq = 40, abajo = 20, techo = Math.max(250, ...recientes.map(p => p.sistema_ms));
+    const x = t => izq + (W - izq - 6) * (1 - (ahora - t) / 60000);
+    const y = v => (H - abajo) * (1 - Math.min(v, techo) / techo) + 4;
+    let svg = "";
+    for (const v of [0, 50, 100, 150, 200]) svg += `<line x1="${izq}" x2="${W}" y1="${y(v)}" y2="${y(v)}" stroke="#2a303c"/><text x="4" y="${y(v) + 4}">${v} ms</text>`;
+    svg += `<line x1="${izq}" x2="${W}" y1="${y(200)}" y2="${y(200)}" stroke="#ff6b6b" stroke-width="2" stroke-dasharray="6 4"/>`;
+    svg += `<text x="${W - 70}" y="${y(200) - 6}" style="fill:#ff8787">deadline</text>`;
+    for (const s of [60, 45, 30, 15, 0]) svg += `<text x="${x(ahora - s * 1000) - 10}" y="${H - 3}">${s ? "-" + s + "s" : "ahora"}</text>`;
+    for (const p of recientes) svg += `<circle cx="${x(p.t)}" cy="${y(p.sistema_ms)}" r="4" fill="${colores[p.decision] || "#fff"}" opacity=".85"/>`;
+    document.getElementById("g").innerHTML = svg;
+    const ult = recientes.filter(p => p.t >= ahora - 10000).map(p => p.sistema_ms);
+    document.getElementById("stats").innerHTML = ult.length
+      ? `Últimos 10 s: <b>${ult.length}</b> compras · mediana <b>${percentil(ult, .5).toFixed(0)} ms</b> · la peor <b>${Math.max(...ult).toFixed(0)} ms</b>`
+      : "Sin compras en los últimos 10 segundos";
+  }
+  async function actualizar() {
+    try {
+      const r = await fetch("/api/estado" + q);
+      if (r.ok) {
+        const e = await r.json();
+        for (const k of ["aprobada", "rechazada", "error"]) document.getElementById(k).textContent = (e.conteos || {})[k] || 0;
+        dibujar(e.recientes || [], e.ahora);
+      }
+    } catch {}
+  }
+  actualizar(); setInterval(actualizar, 1000);
+</script>
+</body>
+</html>

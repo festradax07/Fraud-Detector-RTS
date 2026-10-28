@@ -344,6 +344,50 @@ a 4 no cambian ([ADR-0019](../docs/adr/0019-kafka-como-columna-de-eventos.md)).
 
 ---
 
+## El dashboard de la demo: "D-RTS — Demo en vivo"
+
+Un segundo dashboard, en la misma carpeta (D-RTS), pensado para
+**proyectarlo** durante la demo con QR
+([ADR-0029](../docs/adr/0029-demo-interactiva-y-bloqueo-automatico.md)).
+Lo ve el público, así que se lee sin saber de métricas. Sus datos salen del
+gateway de la demo (`drts_demo_*`) y de los consumidores de Kafka.
+
+| Fila | Panel | Qué muestra | Para decir en voz alta |
+|---|---|---|---|
+| **La clase comprando** | Compras · Fraudes detectados · Tarjetas bloqueadas · Sin decisión a tiempo | los totales de la clase | "Ya detectamos N fraudes" |
+| | Latencia mediana (último minuto) | lo que tarda el sistema, sin el internet de cada uno | "La mitad de sus compras se decidió en menos de X ms" |
+| | Compras por segundo | por resultado (aprobada, rechazada, error) | — |
+| | Latencia de las compras de la clase | mediana y 95% contra la línea de 200ms | "Cuando saturo el motor, sube; cuando le doy CPU, baja" |
+| **Las tarjetas de la clase** | Tarjetas de la clase | una fila por celular: su número de fantasía, su estado, sus compras y sus fraudes | "Busquen su tarjeta: ¿quedó bloqueada?" |
+| | Qué fraudes detectó el sistema | rechazos por motivo | — |
+| | Transacciones por botón | qué probaron (un card testing son 4) | — |
+| **Kafka: cómo aprende el sistema** | Eventos que pasan por Kafka | evaluadas y liquidadas por segundo | "Cada decisión queda como evento" |
+| | Alertas de fraude | lo que procesa el consumidor de alertas | — |
+| | Bloqueos hechos por el camino frío | veces que el consumidor agregó una tarjeta a la lista negra | "El sistema aprendió y bloqueó la tarjeta" |
+| | Atraso de los consumidores | el lag: en 0, el camino frío va al día | — |
+| **El sistema por dentro** | CPU que usa el motor | núcleos: se ve el salto de 1 a 4 con `make demo-cpu` | "Le di más CPU: escalado vertical" |
+| | Carga de fondo | lo que manda el loadgen | "Esto es lo que lo satura" |
+
+**Para leerlo bien:**
+- **El estado de cada tarjeta es el que observaron sus compras.** "En
+  revisión" quiere decir que el motor detectó fraude y el bloqueo viene en
+  camino por Kafka; "bloqueada", que una compra ya dio `BLACKLIST`. Si
+  alguien detecta fraude y no vuelve a comprar, su tarjeta queda "en
+  revisión" aunque el camino frío ya la haya bloqueado: es la consistencia
+  eventual, a la vista.
+- **"Bloqueos hechos por el camino frío" cuenta bloqueos, no tarjetas:**
+  dos rechazos seguidos por card testing son dos bloqueos de la misma
+  tarjeta (bloquear de nuevo no cambia nada). El conteo de tarjetas está en
+  "Tarjetas bloqueadas".
+- **La etiqueta `tarjeta` es una excepción** a la regla de no poner
+  identificadores en las etiquetas de Prometheus: vale porque la demo tiene
+  un conjunto acotado de tarjetas (una por celular, con un tope de 500).
+- **Cada demo empieza en cero** cuando se levanta el gateway. Para "limpiar"
+  la tabla entre ensayos, reiniciarlo:
+  `docker compose --profile sistema --profile demo restart gateway`.
+
+---
+
 ## Qué comparar entre entornos
 
 El objetivo de la evaluación es el **mismo sistema** (la misma imagen) en
