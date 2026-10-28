@@ -19,14 +19,14 @@ El modelo teórico que implementa todo el código: cada transacción es
 
 $$T_i = (a_i,\ M_i,\ O_i,\ D_i), \qquad D_i = a_i + 200\text{ms}$$
 
-- $a_i$: el instante de llegada.
-- $M_i$: la **fase mandatoria**: los chequeos que no se pueden saltear.
-- $O_i$: la **fase opcional**: el scoring de riesgo, que mejora la decisión
+- a<sub>i</sub>: el instante de llegada.
+- M<sub>i</sub>: la **fase mandatoria**: los chequeos que no se pueden saltear.
+- O<sub>i</sub>: la **fase opcional**: el scoring de riesgo, que mejora la decisión
   pero se puede omitir.
-- $D_i$: el deadline absoluto.
+- D<sub>i</sub>: el deadline absoluto.
 
 Es **Computación Imprecisa** (Liu, Lin, Shih, Yu y Zhao, 1991): siempre se
-hace $M_i$, y $O_i$ solo si hay tiempo. Sin tiempo para $O_i$, la respuesta
+hace M<sub>i</sub>, y O<sub>i</sub> solo si hay tiempo. Sin tiempo para O<sub>i</sub>, la respuesta
 sale "degradada" (menos precisa) **pero a tiempo**.
 
 ---
@@ -142,13 +142,13 @@ sequenceDiagram
 
 $$D_{rem} = deadline(ctx) - t_{actual}$$
 
-- Si $D_{rem} < WCET(M) + C_{settle} + C_{net} = 20 + 15 = 35\text{ms}$, se
+- Si D<sub>rem</sub> < WCET(M) + C<sub>settle</sub> + C<sub>net</sub> = 20 + 15 = 35ms, se
   **rechaza sin hacer nada** (`DeadlineExceeded`, motivo `EARLY_DROP`). No
   tiene sentido empezar algo que no puede terminar a tiempo: es *load
   shedding* ([ADR-0003](docs/adr/0003-control-de-admision-temprano.md)).
 - Una request **sin deadline** se rechaza (es un bug del cliente: procesarla
   "sin límite" lo taparía).
-- El $D_{rem}$ de llegada se registra en un histograma: si baja de ~200ms,
+- El D<sub>rem</sub> de llegada se registra en un histograma: si baja de ~200ms,
   la request esperó **antes** de entrar.
 
 ### Paso 3 · Validación
@@ -197,7 +197,7 @@ Computación Imprecisa dos intentos de la misma transacción podrían decidir
 distinto (uno degradado, otro con scoring); lo que vale es lo registrado.
 De paso, el reintento no vuelve a pagar el scoring.
 
-### Paso 6 · Fase mandatoria ($M_i$)
+### Paso 6 · Fase mandatoria (M<sub>i</sub>)
 
 [internal/mandatoria · `Evaluar`](internal/mandatoria/mandatoria.go)
 (funciones puras: no hacen I/O)
@@ -218,28 +218,30 @@ motivo ([ADR-0005](docs/adr/0005-fraude-no-es-error.md)).
 [internal/presupuesto · `Slack`, `CorreOpcional`](internal/presupuesto/presupuesto.go)
 ([ADR-0004](docs/adr/0004-computacion-imprecisa.md))
 
-$D_{rem}$ se **vuelve a calcular acá**, con la mandatoria ya pagada:
+D<sub>rem</sub> se **vuelve a calcular acá**, con la mandatoria ya pagada:
 
 $$S_i = D_{rem} - C_{settle} - C_{net} - WCET(O_i) = D_{rem} - 15 - 80$$
 
-- $S_i \ge 0$ → corre el scoring.
-- $S_i < 0$ → **degradada**: se responde solo con la mandatoria
+- S<sub>i</sub> ≥ 0 → corre el scoring.
+- S<sub>i</sub> < 0 → **degradada**: se responde solo con la mandatoria
   (`is_degraded = true`). Se acepta el riesgo de no haber puntuado a cambio
   de cumplir el deadline.
 
-Con un deadline normal, $D_{rem}$ tras la mandatoria ronda los 199ms y el
+Con un deadline normal, D<sub>rem</sub> tras la mandatoria ronda los 199ms y el
 slack da ~104ms: sobra tiempo. El slack se achica cuando la request llega
 tarde o cuando la máquina está saturada.
 
-### Paso 8 · Fase opcional ($O_i$): scoring de riesgo
+### Paso 8 · Fase opcional (O<sub>i</sub>): scoring de riesgo
 
 [internal/opcional · `Puntuar`](internal/opcional/opcional.go)
 ([ADR-0010](docs/adr/0010-modelo-de-scoring.md))
 
-- **Z-score sobre el logaritmo del monto**, contra la media y el desvío de
-  la categoría del comercio, ponderado por el riesgo de la categoría (tasa
-  de fraude real del dataset):
-  $$z = \frac{\ln(monto) - \mu_{cat}}{\sigma_{cat}}, \qquad score = 1 - 0.25^{\,peso \cdot z^2 / 9}$$
+**Z-score sobre el logaritmo del monto**, contra la media y el desvío de la
+categoría del comercio, ponderado por el riesgo de la categoría (tasa de
+fraude real del dataset):
+
+$$z = \frac{\ln(monto) - \mu_{cat}}{\sigma_{cat}}, \qquad score = 1 - 0.25^{\,peso \cdot z^2 / 9}$$
+
 - `score > 0.75` → `RIESGO_ALTO` (equivale a estar a 3 desvíos de lo normal
   con peso 1).
 - Presupuesto de diseño: **≤ 80ms**. El cálculo real tarda microsegundos,
@@ -263,7 +265,7 @@ rechazo no mueve la tarjeta: si no, un fraude podría "teletransportarla".
 ([ADR-0012](docs/adr/0012-settlement-segundo-servicio-sincronico.md))
 
 Del lado del motor:
-- La llamada tiene **su propio timeout de 15ms** ($C_{settle} + C_{net}$, lo
+- La llamada tiene **su propio timeout de 15ms** (C<sub>settle</sub> + C<sub>net</sub>, lo
   que el slack ya le reservó). `WithTimeout` nunca alarga el deadline: si a
   la request le queda menos, gana el que vence primero.
 
@@ -276,8 +278,8 @@ Del lado de Settlement:
   tiene un resultado final, gana ese (idempotencia,
   [ADR-0013](docs/adr/0013-ambiguedad-del-timeout-e-idempotencia.md)). El
   registro vive en Redis con TTL de 24h.
-- Informa su **tiempo interno** ($C_{settle}$) en un *trailer* gRPC. El motor
-  calcula $C_{net} = total - C_{settle}$: así se separa el costo de la red.
+- Informa su **tiempo interno** (C<sub>settle</sub>) en un *trailer* gRPC. El motor
+  calcula C<sub>net</sub> = total − C<sub>settle</sub>: así se separa el costo de la red.
 
 ### Paso 11 · La respuesta
 
@@ -332,11 +334,11 @@ entera de un `DEADLINE_MISS` (para él la request "salió bien").
 
 | Constante | Valor | Dónde | Qué es |
 |---|---|---|---|
-| `DeadlineGlobal` | 200ms | [presupuesto](internal/presupuesto/presupuesto.go) | $D_i - a_i$ |
-| `WCETMandatoria` | 20ms | presupuesto | peor caso presupuestado de $M_i$ |
-| `WCETOpcional` | 80ms | presupuesto | peor caso presupuestado de $O_i$ |
-| `ReservaSettleNet` | 15ms | presupuesto | $C_{settle} + C_{net}$ |
-| `MinParaAdmitir` | 35ms | presupuesto | $WCET(M) + C_{settle} + C_{net}$ |
+| `DeadlineGlobal` | 200ms | [presupuesto](internal/presupuesto/presupuesto.go) | D<sub>i</sub> − a<sub>i</sub> |
+| `WCETMandatoria` | 20ms | presupuesto | peor caso presupuestado de M<sub>i</sub> |
+| `WCETOpcional` | 80ms | presupuesto | peor caso presupuestado de O<sub>i</sub> |
+| `ReservaSettleNet` | 15ms | presupuesto | C<sub>settle</sub> + C<sub>net</sub> |
+| `MinParaAdmitir` | 35ms | presupuesto | WCET(M) + C<sub>settle</sub> + C<sub>net</sub> |
 
 Peor caso completo: 20 + 80 + 15 = **115ms**, dentro de los 200ms (lo
 verifica un test, `TestCoherenciaDelDiseno`).
@@ -357,13 +359,13 @@ Cada fila enlaza al **código exacto** (archivo y líneas) y a su
 |---|---|---|---|---|
 | 1 | **Deadline del cliente** | 200ms por transacción, medidos desde el instante programado | `DEADLINE_MISS` | [loadgen `enviar`](cmd/loadgen/main.go#L222-L240) · [explicación](#m1) |
 | 2 | **Propagación del deadline** | el mismo plazo llega al motor, a Redis y a Settlement | cada I/O corta cuando vence | [motor `admitir`](cmd/server/main.go#L184-L189) · [Redis](internal/redisclient/redisclient.go#L20-L25) · [explicación](#m2) |
-| 3 | **Admisión** | ¿$D_{rem} \ge 35ms$? | `EARLY_DROP`, sin trabajar | [`Admitir`](internal/presupuesto/presupuesto.go#L42-L44) · [motor](cmd/server/main.go#L184-L198) · [explicación](#m3) |
+| 3 | **Admisión** | ¿D<sub>rem</sub> ≥ 35ms? | `EARLY_DROP`, sin trabajar | [`Admitir`](internal/presupuesto/presupuesto.go#L42-L44) · [motor](cmd/server/main.go#L184-L198) · [explicación](#m3) |
 | 4 | **Fallo rápido** | no quemar el plazo esperando a un Redis caído | error en µs, fail-closed | [`redisclient`](internal/redisclient/redisclient.go#L26-L35) · [explicación](#m4) |
-| 5 | **Slack (Computación Imprecisa)** | ¿$S_i \ge 0$? | respuesta **degradada** | [`Slack`](internal/presupuesto/presupuesto.go#L52-L60) · [motor](cmd/server/main.go#L258-L273) · [explicación](#m5) |
+| 5 | **Slack (Computación Imprecisa)** | ¿S<sub>i</sub> ≥ 0? | respuesta **degradada** | [`Slack`](internal/presupuesto/presupuesto.go#L52-L60) · [motor](cmd/server/main.go#L258-L273) · [explicación](#m5) |
 | 6 | **Reserva para Settlement** | Settlement no puede llevarse el plazo entero | `SETTLEMENT_TIMEOUT` (ambiguo) | [`liquidar`](cmd/server/main.go#L306-L330) · [explicación](#m6) |
 | 7 | **Deadline global en Settlement** | ¿la transacción ya superó los 200ms? | `ABORTED_TIMEOUT`: no se compromete | [Settlement](internal/settlement/settlement.go#L146-L158) · [explicación](#m7) |
 | 8 | **Respuestas tardías** | el servidor terminó para un cliente que ya se fue | métrica `drts_respuestas_tardias_total` | [interceptor](internal/metricas/metricas.go#L127-L143) · [explicación](#m8) |
-| 9 | **Medición del presupuesto** | $D_{rem}$ al llegar, slack, cada fase, $C_{net}$ | — | [`medirSettlement`](cmd/server/main.go#L401-L407) · [explicación](#m9) |
+| 9 | **Medición del presupuesto** | D<sub>rem</sub> al llegar, slack, cada fase, C<sub>net</sub> | — | [`medirSettlement`](cmd/server/main.go#L401-L407) · [explicación](#m9) |
 | 10 | **El presupuesto cierra** | peor caso ≤ 200ms, verificado por un test | el test falla | [`TestCoherenciaDelDiseno`](internal/presupuesto/presupuesto_test.go#L63-L73) · [explicación](#m10) |
 | 11 | **Auditoría** (después, sin plazo) | ¿lo respondido coincide con lo registrado? | marca las discrepancias | [`Clasificar`](internal/auditoria/auditoria.go#L50-L82) · [explicación](#m11) |
 
@@ -413,7 +415,7 @@ eventos van en protobuf.
 
 | Topic | Lo publica | Cuándo | Contiene | Clave |
 |---|---|---|---|---|
-| `drts.transacciones.evaluadas` | el Fraud-Engine | **cada** respuesta (aprobada, rechazada o error), después de responder | lo que respondió el motor: decisión, motivo, score, si fue degradada, $D_{rem}$ al llegar, slack | `card_token` |
+| `drts.transacciones.evaluadas` | el Fraud-Engine | **cada** respuesta (aprobada, rechazada o error), después de responder | lo que respondió el motor: decisión, motivo, score, si fue degradada, D<sub>rem</sub> al llegar, slack | `card_token` |
 | `drts.transacciones.liquidadas` | Settlement | cada registro | lo que quedó registrado: estado y latencia de punta a punta | `tx_id` |
 
 - **El motor no publica "alertas":** publica lo que pasó, todo. Quién
@@ -558,7 +560,7 @@ objetivo de la evaluación.
 | Qué | Valor |
 |---|---|
 | Latencia del cliente con carga nominal (50 RPS) | P50 ~20ms, 100% a tiempo |
-| Costo de red entre motor y Settlement ($C_{net}$) | P50 ~0,3ms (contra 15ms reservados) |
+| Costo de red entre motor y Settlement (C<sub>net</sub>) | P50 ~0,3ms (contra 15ms reservados) |
 | CPU por transacción en el motor | ~21ms (casi todo, el scoring simulado) |
 | Quiebre (donde el % a tiempo baja de 99%) | ~500 RPS; se recupera al bajar de ~470 |
 | Un día de carga (pico 800 RPS, ×60), antes del ADR-0027 | 85% a tiempo en el día; ~65% en el pico de las 19h |
@@ -632,7 +634,7 @@ Las decisiones completas están en los ADRs enlazados.
 | **Conexión** | HTTP/2: muchas requests concurrentes por una sola conexión | HTTP/1.1: una request por conexión a la vez (o un pool de conexiones) |
 | **Errores** | códigos estándar + detalles tipados (`ErrorInfo`, de donde salen los motivos como `EARLY_DROP`) | códigos HTTP + un cuerpo de error a definir |
 | **Salud** | protocolo estándar (`grpc.health.v1`), que entienden Compose, ECS, el ALB y Kubernetes | `/health` a definir |
-| **Metadatos al final** | *trailers*: Settlement informa su $C_{settle}$ ahí | no hay equivalente simple |
+| **Metadatos al final** | *trailers*: Settlement informa su C<sub>settle</sub> ahí | no hay equivalente simple |
 
 **Lo decisivo es la primera fila:** un sistema de tiempo real necesita que
 el plazo llegue a cada salto, y gRPC lo hace sin código propio.
@@ -973,7 +975,7 @@ func Admitir(dRem time.Duration) bool {
 	}
 ```
 
-- $D_{rem}$ = el deadline menos ahora. `MinParaAdmitir` es
+- D<sub>rem</sub> = el deadline menos ahora. `MinParaAdmitir` es
   `WCETMandatoria + ReservaSettleNet` = 20 + 15 = 35ms. Si no alcanza para lo
   mínimo (la mandatoria más Settlement y la red), se rechaza **antes de hacer nada**:
   no se consulta Redis, no se gasta CPU. Es *load shedding*.
@@ -1041,7 +1043,7 @@ func (s *fraudEngineServer) faseOpcional(ctx context.Context, req *pb.Transactio
 }
 ```
 
-- `Slack` es $S_i = D_{rem} - 15 - 80$: lo que sobraría si el scoring
+- `Slack` es S<sub>i</sub> = D<sub>rem</sub> − 15 − 80: lo que sobraría si el scoring
   tardara su peor caso y después viniera Settlement.
 - `time.Until(deadline)` **se vuelve a calcular acá**, después de la
   mandatoria: lo que importa es cuánto queda **ahora**, con el viaje a Redis
@@ -1154,11 +1156,11 @@ func (s *fraudEngineServer) medirSettlement(total time.Duration, trailer metadat
 }
 ```
 
-- El presupuesto reserva 15ms para $C_{settle} + C_{net}$. Para saber si
+- El presupuesto reserva 15ms para C<sub>settle</sub> + C<sub>net</sub>. Para saber si
   alcanza, hay que medir **cada parte**.
-- Settlement informa su tiempo interno ($C_{settle}$) en un *trailer* gRPC.
+- Settlement informa su tiempo interno (C<sub>settle</sub>) en un *trailer* gRPC.
   El motor mide la llamada completa y despeja
-  $C_{net} = total - C_{settle}$: el costo de la red.
+  C<sub>net</sub> = total − C<sub>settle</sub>: el costo de la red.
 - Lo mismo se hace con cada fase (mandatoria, opcional): son los datos para
   recalibrar los presupuestos con mediciones, entorno por entorno.
 
@@ -1182,7 +1184,7 @@ func TestCoherenciaDelDiseno(t *testing.T) {
 ```
 
 - Es el análisis de factibilidad del diseño, escrito como test: la suma de
-  los peores casos ($20 + 80 + 15 = 115\text{ms}$) tiene que entrar en los
+  los peores casos (20 + 80 + 15 = 115ms) tiene que entrar en los
   200ms.
 - Si alguien sube un presupuesto (por ejemplo, el WCET de la opcional a
   110ms), el test falla y avisa que la cuenta del diseño dejó de cerrar.
@@ -1229,7 +1231,7 @@ func Clasificar(evaluadas []*pb.TransaccionEvaluada, liquidada *pb.TransaccionLi
 | Término | Qué es |
 |---|---|
 | **Deadline duro** | plazo que, si se pasa, la respuesta cuenta como falla |
-| **$D_{rem}$** | tiempo que le queda a la transacción: deadline − ahora |
+| **D<sub>rem</sub>** | tiempo que le queda a la transacción: deadline − ahora |
 | **WCET** | *Worst-Case Execution Time*: el peor tiempo de ejecución presupuestado |
 | **Slack** | cuánto sobraría si se corre la fase opcional en su peor caso |
 | **Degradada** | respondida solo con la fase mandatoria, por falta de tiempo |

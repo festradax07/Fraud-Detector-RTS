@@ -67,23 +67,23 @@ Todo corre sobre **infraestructura real**: no hay Redis falsos ni mocks
 
 ## El modelo de tiempo real
 
-Cada transacción es $T_i = (a_i, M_i, O_i, D_i)$, con deadline
-$D_i = a_i + 200\,ms$.
+Cada transacción es T<sub>i</sub> = (a<sub>i</sub>, M<sub>i</sub>, O<sub>i</sub>, D<sub>i</sub>), con deadline
+D<sub>i</sub> = a<sub>i</sub> + 200 ms.
 
 | Pieza | Qué es | Presupuesto de diseño |
 |---|---|---|
-| **Fase mandatoria** $M_i$ | blacklist, control de velocidad (más de 3 intentos en 10s = *card testing*), viaje imposible (más de 800 km/h entre dos compras) | $WCET(M) = 20\,ms$ |
-| **Fase opcional** $O_i$ | scoring de riesgo: Z-score sobre $\ln(\text{monto})$ ponderado por categoría de comercio | $WCET(O) = 80\,ms$ |
-| **Settlement + red** | registrar el resultado en el segundo servicio | $C_{settle} + C_{net} = 15\,ms$ |
+| **Fase mandatoria** M<sub>i</sub> | blacklist, control de velocidad (más de 3 intentos en 10s = *card testing*), viaje imposible (más de 800 km/h entre dos compras) | WCET(M) = 20 ms |
+| **Fase opcional** O<sub>i</sub> | scoring de riesgo: Z-score sobre \ln(monto) ponderado por categoría de comercio | WCET(O) = 80 ms |
+| **Settlement + red** | registrar el resultado en el segundo servicio | C<sub>settle</sub> + C<sub>net</sub> = 15 ms |
 
 Dos decisiones temporales gobiernan cada transacción:
 
 - **Admisión** (al llegar, antes de cualquier trabajo):
-  $D_{rem} = deadline - ahora$. Si $D_{rem} < WCET(M) + C_{settle} + C_{net}$
+  D<sub>rem</sub> = deadline − ahora. Si D<sub>rem</sub> < WCET(M) + C<sub>settle</sub> + C<sub>net</sub>
   (35ms), se rechaza en el acto
   ([ADR-0003](docs/adr/0003-control-de-admision-temprano.md)).
 - **Slack** (después de la mandatoria):
-  $S_i = D_{rem} - C_{settle} - C_{net} - WCET(O)$. Si $S_i \geq 0$ corre el
+  S<sub>i</sub> = D<sub>rem</sub> − C<sub>settle</sub> − C<sub>net</sub> − WCET(O). Si S<sub>i</sub> ≥ 0 corre el
   scoring; si no, la respuesta sale solo con la mandatoria y marcada como
   degradada ([ADR-0004](docs/adr/0004-computacion-imprecisa.md)).
 
@@ -402,7 +402,7 @@ Dos hallazgos importan más:
 - **El colapso por congestión.** Sin una cola delante del handler, toda
   request pasa la admisión con ~200ms y después todas compiten por el CPU y
   vencen juntas: pasado el quiebre, el sistema entrega **menos** que con
-  menos carga. La admisión solo protege si hay espera que consuma $D_{rem}$
+  menos carga. La admisión solo protege si hay espera que consuma D<sub>rem</sub>
   ([ADR-0003](docs/adr/0003-control-de-admision-temprano.md)).
 - **La auditoría encontró un bug que ningún test había visto:** bajo
   sobrecarga, un reintento podía responder "rechazada" sobre una transacción
@@ -571,7 +571,7 @@ dashboard **"D-RTS — Tiempo real"** se lee de arriba hacia abajo:
 1. **Lo que ve el cliente:** % dentro del deadline, carga ofrecida vs
    *goodput*, resultados por categoría, latencia con la línea de los 200ms.
 2. **Por qué:** requests en vuelo, respuestas tardías (el servidor no se
-   entera de un *deadline miss*: esta métrica lo deja ver), $D_{rem}$ al
+   entera de un *deadline miss*: esta métrica lo deja ver), D<sub>rem</sub> al
    llegar, slack, decisiones, duración de cada fase.
 3. **Settlement:** estados registrados y latencia de extremo a extremo.
 4. **Runtime de Go y CPU:** núcleos por proceso, pausas del GC, goroutines.

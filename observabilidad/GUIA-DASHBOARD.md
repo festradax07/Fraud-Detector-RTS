@@ -178,7 +178,7 @@ Los seis paneles que dicen si hay un problema:
   vería espera antes del handler.
 
 **Slack al decidir la fase opcional**
-- **Qué es:** $S_i = D_{rem} − C_{settle} − C_{net} − WCET(O)$, medido después
+- **Qué es:** S<sub>i</sub> = D<sub>rem</sub> − C<sub>settle</sub> − C<sub>net</sub> − WCET(O), medido después
   de la mandatoria. Arriba de 0 corre el scoring; debajo, la respuesta sale
   degradada.
 - **Métrica:** `drts_slack_segundos`.
