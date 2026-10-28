@@ -5,6 +5,7 @@
 /eventos
 /cargar-stats
 /salud
+/gateway
 *.exe
 
 # Documentos privados (guía, roadmap). Los ADRs (docs/adr/) son públicos.

@@ -261,7 +261,8 @@ la auditoría bajo carga).
 | [`loadgen`](cmd/loadgen/main.go) | **Generador de carga** de lazo abierto (llegadas de Poisson). Tasa fija o un **perfil del día** con picos ([`perfiles/`](perfiles/)). Mide la latencia desde el instante programado, clasifica resultados y reintenta los ambiguos. Métricas `:2114`. | 0014, 0026 |
 | [`cargar-stats`](cmd/cargar-stats/main.go) | Calcula media, desvío y peso de riesgo por categoría (algoritmo de Welford) desde el dataset y los guarda en Redis. | 0010 |
 | [`salud`](cmd/salud/main.go) | Chequeo de salud por gRPC para contenedores sin shell. | 0020 |
-| [`eventos`](cmd/eventos/main.go) | **Consumidores del cold path**, un rol por contenedor: `auditoria` (cruza los dos topics y detecta discrepancias), `alertas`, `estadisticas` (modo sombra) y `volcar` (muestra los eventos como JSON). | 0025 |
+| [`eventos`](cmd/eventos/main.go) | **Consumidores del cold path**, un rol por contenedor: `auditoria` (cruza los dos topics y detecta discrepancias), `alertas` (y **bloqueo automático** de tarjetas ante card testing o viaje imposible), `estadisticas` (modo sombra) y `volcar` (muestra los eventos como JSON). | 0025, 0029 |
+| [`gateway`](cmd/gateway/main.go) | **Gateway de la demo con QR.** Recibe compras desde el celular (HTTP) y las manda al motor (gRPC), poniendo el deadline de 200ms en el borde. Página del celular (tarjeta propia, escenarios de fraude, desglose de latencia) y del presentador (QR y gráfico en vivo). Puerto `:8080`, métricas `:2116`. | 0029 |
 
 ### Paquetes (`internal/`)
 
@@ -303,7 +304,8 @@ solo si cambia un `.proto`.
 │   ├── loadgen/           generador de carga
 │   ├── cargar-stats/      estadísticas del scoring → Redis
 │   ├── salud/             chequeo de salud para contenedores
-│   └── eventos/           consumidores del cold path (un rol por contenedor)
+│   ├── eventos/           consumidores del cold path (un rol por contenedor)
+│   └── gateway/           gateway de la demo con QR (HTTP → gRPC)
 ├── internal/              toda la lógica (no importable desde afuera del módulo)
 ├── observabilidad/        Prometheus y Grafana, provisionados desde archivos
 ├── perfiles/              curvas de carga del día para el loadgen (ADR-0026)
@@ -350,7 +352,7 @@ solo si cambia un `.proto`.
 | **Correctitud ante fallas** | [0005](docs/adr/0005-fraude-no-es-error.md) un fraude no es un error · [0009](docs/adr/0009-fail-closed-y-fallo-rapido.md) fail-closed y fallo rápido · [0012](docs/adr/0012-settlement-segundo-servicio-sincronico.md) Settlement con timeout propio · [0013](docs/adr/0013-ambiguedad-del-timeout-e-idempotencia.md) ambigüedad del timeout e idempotencia · [0022](docs/adr/0022-conexion-caida-es-resultado-ambiguo.md) conexión caída = ambiguo · [0027](docs/adr/0027-reintento-responde-lo-registrado.md) un reintento responde lo registrado |
 | **Detección** | [0006](docs/adr/0006-que-se-registra-ante-un-rechazo.md) qué se registra ante un rechazo · [0007](docs/adr/0007-validacion-estricta-de-la-request.md) validación · [0008](docs/adr/0008-redis-un-viaje-atomico.md) Redis en un viaje atómico · [0010](docs/adr/0010-modelo-de-scoring.md) scoring |
 | **Cold path (Kafka)** | [0019](docs/adr/0019-kafka-como-columna-de-eventos.md) Kafka al costado · [0023](docs/adr/0023-redes-como-subredes-privadas.md) redes como subredes privadas · [0024](docs/adr/0024-eventos-en-protobuf-sin-bloquear.md) eventos en protobuf sin bloquear · [0025](docs/adr/0025-consumidores-y-auditoria.md) consumidores y auditoría |
-| **Medir y operar** | [0014](docs/adr/0014-load-generator-de-lazo-abierto.md) generador de lazo abierto · [0015](docs/adr/0015-observabilidad-prometheus-grafana.md) observabilidad · [0016](docs/adr/0016-tests-contra-infraestructura-real.md) tests reales · [0017](docs/adr/0017-configuracion-por-entorno-y-apagado-ordenado.md) configuración y apagado · [0018](docs/adr/0018-evaluar-en-distintos-entornos.md) evaluar por entornos · [0020](docs/adr/0020-imagenes-salud-y-compose.md) imágenes, salud y Compose · [0021](docs/adr/0021-logs-con-niveles.md) logs con niveles · [0026](docs/adr/0026-perfil-de-carga-diario.md) perfil de carga diario · [0028](docs/adr/0028-metricas-de-evaluacion-sli-slo-sla.md) métricas oficiales, SLI y SLO |
+| **Medir y operar** | [0014](docs/adr/0014-load-generator-de-lazo-abierto.md) generador de lazo abierto · [0015](docs/adr/0015-observabilidad-prometheus-grafana.md) observabilidad · [0016](docs/adr/0016-tests-contra-infraestructura-real.md) tests reales · [0017](docs/adr/0017-configuracion-por-entorno-y-apagado-ordenado.md) configuración y apagado · [0018](docs/adr/0018-evaluar-en-distintos-entornos.md) evaluar por entornos · [0020](docs/adr/0020-imagenes-salud-y-compose.md) imágenes, salud y Compose · [0021](docs/adr/0021-logs-con-niveles.md) logs con niveles · [0026](docs/adr/0026-perfil-de-carga-diario.md) perfil de carga diario · [0028](docs/adr/0028-metricas-de-evaluacion-sli-slo-sla.md) métricas oficiales, SLI y SLO · [0029](docs/adr/0029-demo-interactiva-y-bloqueo-automatico.md) demo con QR y bloqueo automático |
 
 ## Cómo se evalúa
 
@@ -417,7 +419,7 @@ pero distribuido: cada pieza en su host y hablando por la red real. Es la
 diferencia con la notebook que se quiere medir. Al mismo tiempo, está
 diseñado para costar poco: se crea con Terraform, se mide y se destruye.
 Estado: **diseño**. La implementación es la Etapa 7.6; las decisiones van al
-ADR-0029 y el diagrama se genera desde
+ADR-0030 y el diagrama se genera desde
 [`docs/adr/img/arquitectura-aws.py`](docs/adr/img/arquitectura-aws.py).
 
 **Qué hace cada parte:**
@@ -498,6 +500,25 @@ del pico y `-compresion 60` hace que 1 hora del perfil dure 1 minuto. Al
 final se imprime, además, un resumen **por franja horaria**: el pico es lo
 que importa.
 
+### La demo con QR
+
+```sh
+make demo-up                          # el sistema + el gateway de la demo
+# en el navegador: http://<IP de la máquina>:8080/presentador?t=demo-local  → el QR
+make demo-cpu CPUS=1                  # el motor limitado a 1 núcleo
+make demo-carga                       # carga de fondo (55 RPS): el sistema queda al borde
+make demo-cpu CPUS=4                  # más capacidad, en vivo: la latencia baja
+```
+
+Los asistentes escanean el QR, compran con su propia tarjeta (de fantasía)
+e intentan engañar al motor (card testing, viaje imposible, tarjeta robada,
+monto anormal). Ven en su celular cuánto tardó cada parte (su internet, la
+espera en el sistema, el motor), y si su tarjeta queda bloqueada: el
+**camino frío** la bloquea por Kafka unos milisegundos después
+([ADR-0029](docs/adr/0029-demo-interactiva-y-bloqueo-automatico.md)). El
+token del QR se cambia con `DEMO_TOKEN`. Abrí el presentador con la IP de
+la máquina, no con `localhost`: el QR apunta al mismo host.
+
 ## Configuración
 
 Por variables de entorno ([ADR-0017](docs/adr/0017-configuracion-por-entorno-y-apagado-ordenado.md)).
@@ -520,6 +541,8 @@ escrito impide arrancar.
 | `SETTLEMENT_TTL` | — | `24h` | cuánto vive cada registro de Settlement en Redis (mientras se pueda reintentar) |
 
 El generador de carga se configura por flags: `go run ./cmd/loadgen -h`.
+El consumidor de alertas bloquea tarjetas según `BLOQUEO_AUTOMATICO` (por
+ejemplo `CARD_TESTING,VIAJE_IMPOSIBLE`; vacío = sin bloqueo).
 
 ## Observabilidad
 
@@ -558,6 +581,11 @@ dashboard **"D-RTS — Tiempo real"** se lee de arriba hacia abajo:
    estadísticas en sombra. Con Kafka caído, las filas 1–4 no cambian: es la
    forma de verlo.
 
+Para la demo hay un segundo dashboard, **"D-RTS — Demo en vivo"**: las
+compras de la clase, la latencia contra el deadline, la **tabla de
+tarjetas** (cada uno busca la suya y ve si quedó activa, en revisión o
+bloqueada), los fraudes por tipo y cómo aprende el sistema por Kafka.
+
 Qué muestra cada panel, cómo leerlo, cómo diagnosticar con él y qué
 métricas comparar entre entornos:
 [observabilidad/GUIA-DASHBOARD.md](observabilidad/GUIA-DASHBOARD.md).
@@ -593,9 +621,9 @@ respuesta, un puerto donde no escucha nadie.
 | Corrección: un reintento responde lo registrado (lo encontró la auditoría) | ✅ ([ADR-0027](docs/adr/0027-reintento-responde-lo-registrado.md)) |
 | Métricas oficiales y objetivos (SLI, SLO, SLA) | ✅ ([ADR-0028](docs/adr/0028-metricas-de-evaluacion-sli-slo-sla.md)) |
 | Experimento: Kafka en el camino de decisión (modo asíncrono) | planificado |
-| Nube (AWS): arquitectura y diagrama | ✅ diseño · ADR-0029 por escribir |
+| Nube (AWS): arquitectura y diagrama | ✅ diseño · ADR-0030 por escribir |
 | Nube (AWS): Terraform, CI/CD, medición (fase 1: una EC2 · fase 2: distribuido con auto scaling) | en curso |
-| Demo interactiva con QR | planificado |
+| Demo interactiva con QR: gateway, tarjeta por celular, bloqueo automático por el camino frío, dashboard de la demo | ✅ ([ADR-0029](docs/adr/0029-demo-interactiva-y-bloqueo-automatico.md)) |
 | Calibración por entorno: pool de workers contra el colapso por congestión, pausas del GC, comparación nativo / Compose / nube | planificado |
 
 ## Referencias

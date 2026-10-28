@@ -15,6 +15,7 @@ import (
 
 	"fd_rts/internal/auditoria"
 	"fd_rts/internal/eventos"
+	"fd_rts/internal/mandatoria"
 	"fd_rts/internal/opcional"
 	"fd_rts/internal/pruebas"
 	pb "fd_rts/proto"
@@ -196,5 +197,60 @@ func TestEstadisticasEnSombra(t *testing.T) {
 	h, _ := rdb.HGetAll(ctx0, prefijo+"stats:cat").Result()
 	if e, ok, err := opcional.ParsearEstadisticas(h); !ok || err != nil || math.Abs(e.MediaLog-math.Log(100)) > 1e-12 {
 		t.Errorf("la línea base cambió: %v", h)
+	}
+}
+
+// Bloqueo automático (ADR-0029): un fraude con motivo fuerte (card testing)
+// bloquea la tarjeta; uno dudoso (riesgo alto: puede ser una compra legítima)
+// no. Contra Kafka y Redis reales.
+func TestBloqueoAutomatico(t *testing.T) {
+	brokers, nombres := pruebas.Kafka(t, "evaluadas", "liquidadas")
+	topics := eventos.Topics{Evaluadas: nombres[0], Liquidadas: nombres[1]}
+	rdb, prefijo := pruebas.Redis(t)
+	ctx0 := context.Background()
+
+	prod, err := eventos.NuevoProductor(brokers, topics, prometheus.NewRegistry())
+	if err != nil {
+		t.Fatalf("productor: %v", err)
+	}
+	fraude := func(tx, tarjeta, motivo string) *pb.TransaccionEvaluada {
+		return &pb.TransaccionEvaluada{TxId: tx, CardToken: tarjeta, MerchantCategory: "cat", Amount: 10,
+			Evaluacion: &pb.EvaluationResponse{TxId: tx, IsFraud: true, RejectionReason: motivo}}
+	}
+	prod.PublicarEvaluada(fraude("t1", "testeada", mandatoria.MotivoCardTesting))
+	prod.PublicarEvaluada(fraude("t2", "monto-raro", opcional.MotivoRiesgoAlto))
+	ctxF, cancelF := context.WithTimeout(ctx0, 10*time.Second)
+	prod.Cerrar(ctxF)
+	cancelF()
+
+	bloqueo := &bloqueoAutomatico{
+		verificador: mandatoria.NuevoVerificador(rdb, prefijo),
+		motivos:     motivosDeBloqueo("CARD_TESTING, VIAJE_IMPOSIBLE"),
+	}
+	reg := prometheus.NewRegistry()
+	ctx, cancel := context.WithCancel(ctx0)
+	defer cancel()
+	fin := make(chan error, 1)
+	grupo := fmt.Sprintf("test-alertas-%d", time.Now().UnixNano())
+	go func() { fin <- alertar(ctx, brokers, topics, grupo, bloqueo, reg) }()
+
+	esperar(t, func() bool { return valor(t, reg, "drts_alertas_total", opcional.MotivoRiesgoAlto) == 1 }, "las dos alertas procesadas")
+	terminar(t, cancel, fin)
+
+	enLista := func(tarjeta string) bool {
+		ok, err := rdb.SIsMember(ctx0, prefijo+"blacklist", tarjeta).Result()
+		if err != nil {
+			t.Fatalf("SISMEMBER: %v", err)
+		}
+		return ok
+	}
+	if !enLista("testeada") {
+		t.Error("la tarjeta con card testing no quedó bloqueada")
+	}
+	if enLista("monto-raro") {
+		t.Error("un riesgo alto bloqueó la tarjeta: tendría que solo rechazar la compra")
+	}
+	if v := valor(t, reg, "drts_bloqueos_total", mandatoria.MotivoCardTesting); v != 1 {
+		t.Errorf("drts_bloqueos_total{CARD_TESTING} = %v, se esperaba 1", v)
 	}
 }

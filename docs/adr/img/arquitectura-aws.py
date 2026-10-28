@@ -1,4 +1,4 @@
-"""Genera el esquema de la arquitectura propuesta en AWS (ADR-0029).
+"""Genera el esquema de la arquitectura propuesta en AWS (ADR-0030).
 
 Diagrama como código: este script arma un SVG con los íconos oficiales de
 AWS (los que trae la librería `diagrams`) y una disposición fija, para que

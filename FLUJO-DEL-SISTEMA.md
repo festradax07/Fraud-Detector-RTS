@@ -51,7 +51,8 @@ flowchart LR
 | **Settlement** | Registra la decisión, una sola vez por transacción | **caliente** | [internal/settlement](internal/settlement/settlement.go) |
 | **Redis** | Blacklist, ventana de velocidad, última posición, estadísticas, registros | **caliente** | [internal/mandatoria](internal/mandatoria/mandatoria.go) |
 | **Kafka + consumidores** | Auditoría, alertas, estadísticas en vivo | **frío** (sin deadline) | [cmd/eventos](cmd/eventos/main.go) |
-| **Prometheus + Grafana** | Métricas y dashboard | fuera del flujo | [observabilidad/](observabilidad/) |
+| **Prometheus + Grafana** | Métricas y dashboards | fuera del flujo | [observabilidad/](observabilidad/) |
+| **Gateway de la demo** | Recibe compras desde el celular (HTTP) y las manda al motor (gRPC), poniendo el deadline en el borde | **caliente** (es el borde, como el loadgen) | [cmd/gateway](cmd/gateway/main.go) |
 
 Por qué se eligió cada herramienta (gRPC y no REST, Redis, Kafka, etc.):
 [sección 12](#12-por-qué-cada-herramienta).
@@ -390,34 +391,118 @@ Tres reglas atraviesan todo:
 
 ---
 
-## 7. El camino frío: auditoría, alertas y estadísticas
+## 7. El camino frío: Kafka, los consumidores y cómo aprende el sistema
 
 [cmd/eventos](cmd/eventos/main.go),
+[internal/eventos](internal/eventos/eventos.go),
+[internal/consumo](internal/consumo/consumo.go),
 [internal/auditoria](internal/auditoria/auditoria.go)
-([ADR-0025](docs/adr/0025-consumidores-y-auditoria.md))
+([ADR-0019](docs/adr/0019-kafka-como-columna-de-eventos.md),
+[ADR-0024](docs/adr/0024-eventos-en-protobuf-sin-bloquear.md),
+[ADR-0025](docs/adr/0025-consumidores-y-auditoria.md),
+[ADR-0029](docs/adr/0029-demo-interactiva-y-bloqueo-automatico.md))
 
-Tres consumidores leen los eventos de Kafka, cada uno a su ritmo:
+El camino caliente decide; el camino frío **registra, verifica y
+aprende**, sin plazo y sin poder frenar una respuesta.
 
-- **Auditoría:** cruza, por `tx_id`, lo que respondió el motor con lo que
-  registró Settlement (espera hasta 30s la pareja) y lo guarda en
-  `auditoria/AAAA-MM-DD.jsonl`.
+### Los topics: qué se publica
 
-  | Resultado | Significa |
-  |---|---|
-  | CONSISTENTE | respuesta = registro |
-  | NO_COMPROMETIDA | error y nada registrado (coherente) |
-  | AMBIGUA_COMPROMETIDA | el cliente vio error, pero se comprometió |
-  | REGISTRO_PERDIDO | decisión sin registro |
-  | EVENTO_PERDIDO | falta el evento de un lado |
-  | INCONSISTENTE | la respuesta contradice el registro: **un bug** |
+Un **topic** es un registro (*log*) con nombre, al que los productores le
+agregan eventos al final y del que cada consumidor lee a su ritmo. Los
+eventos van en protobuf.
 
-  Fue la auditoría la que encontró, bajo carga, el bug que corrigió el
-  ADR-0027.
-- **Alertas:** un aviso por cada fraude detectado.
-- **Estadísticas en sombra:** recalcula en vivo la media y el desvío por
-  categoría (algoritmo de Welford) y mide cuánto se alejan de la línea
-  base. El motor **no** las usa todavía: se observan antes de confiar en
-  ellas.
+| Topic | Lo publica | Cuándo | Contiene | Clave |
+|---|---|---|---|---|
+| `drts.transacciones.evaluadas` | el Fraud-Engine | **cada** respuesta (aprobada, rechazada o error), después de responder | lo que respondió el motor: decisión, motivo, score, si fue degradada, $D_{rem}$ al llegar, slack | `card_token` |
+| `drts.transacciones.liquidadas` | Settlement | cada registro | lo que quedó registrado: estado y latencia de punta a punta | `tx_id` |
+
+- **El motor no publica "alertas":** publica lo que pasó, todo. Quién
+  reacciona y cómo lo deciden los consumidores. Así se pueden sumar
+  consumidores nuevos sin tocar el motor.
+- **Particiones y clave:** cada topic tiene 3 particiones (para que varios
+  consumidores de un mismo grupo puedan repartirse el trabajo). La clave
+  decide la partición: con la tarjeta como clave, **todos los eventos de una
+  tarjeta van a la misma partición y se leen en orden**.
+- **Retención de 7 días:** los eventos no se borran al leerlos. Un
+  consumidor que se cayó retoma donde quedó, y uno nuevo puede procesar la
+  historia.
+- **Publicar nunca bloquea** (`TryProduce` con un buffer de 10.000): si
+  Kafka está caído, los eventos esperan en memoria; si el buffer se llena,
+  se descartan y se cuentan. La transacción no se entera.
+
+### Los consumidores: quién lee qué
+
+Cada consumidor es un **consumer group** propio: Kafka lleva por separado
+hasta dónde leyó cada grupo (su *offset*), así que los tres leen todos los
+eventos, cada uno a su ritmo, sin pisarse.
+
+| Consumidor (grupo) | Lee | Qué hace | Qué deja |
+|---|---|---|---|
+| **Auditoría** (`drts-auditoria`) | los dos topics | cruza, por `tx_id`, lo que respondió el motor con lo que registró Settlement (espera hasta 30s la pareja) | `auditoria/AAAA-MM-DD.jsonl` y métricas por resultado |
+| **Alertas** (`drts-alertas`) | evaluadas | avisa cada fraude, y **bloquea la tarjeta** si el motivo es una señal fuerte | la tarjeta en la **blacklist** de Redis |
+| **Estadísticas en sombra** (`drts-estadisticas`) | evaluadas (las aprobadas) | recalcula media y desvío por categoría (Welford) y mide cuánto se alejan de la línea base | `stats_vivo:*` en Redis (el motor todavía no las usa) |
+
+**Entrega "al menos una vez":** el consumidor confirma el *offset*
+**después** de procesar. Si se cae en el medio, al volver reprocesa algunos
+eventos. Por eso todo lo que hacen es **idempotente**: la auditoría cruza
+por `tx_id`, y bloquear dos veces la misma tarjeta (`SADD`) no cambia nada.
+
+Los resultados de la auditoría:
+
+| Resultado | Significa |
+|---|---|
+| CONSISTENTE | respuesta = registro |
+| NO_COMPROMETIDA | error y nada registrado (coherente) |
+| AMBIGUA_COMPROMETIDA | el cliente vio error, pero se comprometió |
+| REGISTRO_PERDIDO | decisión sin registro |
+| EVENTO_PERDIDO | falta el evento de un lado |
+| INCONSISTENTE | la respuesta contradice el registro: **un bug** |
+
+Fue la auditoría la que encontró, bajo carga, el bug que corrigió el
+ADR-0027.
+
+### Cómo aprende el sistema: el bloqueo automático
+
+```
+compra con card testing ──► motor: rechaza (CARD_TESTING) ──► responde        ← camino caliente (ms)
+                                  └──► evento "evaluada" ──► Kafka
+                                                              └──► consumidor de alertas
+                                                                     └──► SADD blacklist en Redis   ← camino frío (~45ms después)
+
+compra siguiente con esa tarjeta ──► motor: viaje 1 a Redis (SISMEMBER) ──► BLACKLIST
+```
+
+- **Señal fuerte** (card testing, viaje imposible): la tarjeta se bloquea.
+  **Señal dudosa** (un monto anormal, `RIESGO_ALTO`): se rechaza la compra
+  pero la tarjeta sigue activa, porque podría ser legítima; en la vida real
+  se le preguntaría al titular. Configurable con `BLOQUEO_AUTOMATICO`.
+- **Se bloquea la tarjeta, no la transacción:** la que disparó el fraude ya
+  se rechazó en el camino caliente; el bloqueo es para las próximas.
+- **Lo hace el camino frío, no el motor**, como en los sistemas reales: el
+  motor decide en milisegundos y no escribe la blacklist; reaccionar es
+  trabajo de los sistemas que procesan las alertas.
+- **Es eventualmente consistente:** medido, el bloqueo llega a Redis unos
+  45ms después de la respuesta. Una compra en ese instante puede pasar.
+- **Lo ven todas las réplicas del motor a la vez**, sin avisarle a ninguna:
+  el estado vive en Redis, no en el motor.
+
+### Redis: el estado vivo de cada tarjeta
+
+Lo que el motor lee en su viaje 1 lo escriben distintas piezas, en
+distintos momentos:
+
+| Estado | Clave en Redis | Lo escribe | Cuándo |
+|---|---|---|---|
+| intentos recientes (ventana de 10s) | `vel:<tarjeta>` (ZSET) | el motor | en cada compra (viaje 1) |
+| última posición confiable | `pos:<tarjeta>` (con TTL) | el motor | en cada compra **aprobada** (viaje 2) |
+| si está bloqueada | `blacklist` (SET) | el consumidor de alertas; `cargar-stats` (la tarjeta robada de la demo) | después, desde el camino frío |
+| resultado de cada transacción | `settle:<tx_id>` (con TTL de 24h) | Settlement | al registrar |
+| estadísticas del scoring | `stats:<categoría>` | `cargar-stats` | al levantar el sistema |
+| estadísticas en vivo (sombra) | `stats_vivo:<categoría>` | el consumidor de estadísticas | cada 10s |
+
+En una frase: **el motor decide rápido con lo que sabe; el camino frío
+aprende después y deja lo aprendido en Redis; la próxima compra ya lo
+sabe.**
 
 ---
 
@@ -429,6 +514,12 @@ dashboard "D-RTS — Tiempo real", provisionado desde archivos
 arriba hacia abajo: lo que ve el cliente → por qué (el motor por dentro) →
 Settlement → CPU y runtime → camino frío. Qué muestra cada panel y cómo
 diagnosticar con él: [observabilidad/GUIA-DASHBOARD.md](observabilidad/GUIA-DASHBOARD.md).
+
+Para la demo hay un segundo dashboard, **"D-RTS — Demo en vivo"**, pensado
+para que lo vea el público: las compras de la clase, la latencia contra el
+deadline, **la tabla de tarjetas** (cada uno busca la suya por el número de
+fantasía y ve si quedó activa, en revisión o bloqueada), los fraudes por
+tipo y cómo aprende el sistema por Kafka (alertas, bloqueos, lag).
 
 ---
 
@@ -736,6 +827,47 @@ cuenta). Medido: con Kafka caído, las decisiones dan igual.
 - **Compose** levanta el sistema completo en una máquina, con un orden de
   arranque dado por los chequeos de salud y con **redes separadas que
   imitan las subredes de una VPC** (el mismo diseño que en AWS).
+
+## 13. La demo interactiva: el sistema en manos del público
+
+[cmd/gateway](cmd/gateway/main.go)
+([ADR-0029](docs/adr/0029-demo-interactiva-y-bloqueo-automatico.md))
+
+```
+celular ──HTTP/JSON (internet)──► gateway ──gRPC, deadline 200ms──► Fraud-Engine ──► Settlement ──► Redis
+   └── mide el total                 └── el reloj de los 200ms arranca acá: el borde del sistema
+```
+
+- **El gateway hace de pasarela de pagos:** el navegador no habla gRPC, así
+  que el gateway recibe la compra por HTTP y la manda al motor por gRPC.
+  **Pone el deadline de 200ms en el borde**, como una pasarela real: el
+  tiempo de internet del celular queda afuera del presupuesto del motor.
+- **El celular ve dónde se fue su tiempo**, en tres partes:
+
+  | Parte | Cómo se calcula |
+  |---|---|
+  | **tu internet** (ida y vuelta) | el total que midió el celular − el tiempo dentro del servidor |
+  | **red interna y espera** | el tiempo dentro del servidor − lo que informa el motor. Crece cuando el sistema se satura |
+  | **el motor decidiendo** | `processing_time_ms`, que informa el propio motor |
+
+- **Cada celular tiene su tarjeta** (un número de fantasía, `DRTS ...`, que
+  calcula el servidor y es el mismo que aparece en el dashboard). Los
+  escenarios de fraude usan esa tarjeta: un card testing o un viaje
+  imposible la hacen **bloquear por el camino frío** (sección 7), y el
+  celular puede pedir una nueva. La "tarjeta robada" es la de otra
+  persona, que ya está en la lista negra.
+- **Más capacidad, menos latencia, en vivo:** en una sola máquina, se limita
+  el motor a 1 núcleo y se lo satura con carga de fondo (el loadgen); al
+  darle 4 núcleos en vivo (`make demo-cpu`), las compras vuelven a ser
+  rápidas. Es **escalado vertical** (más CPU a la misma máquina); el
+  horizontal (sumar máquinas) es el auto scaling de la arquitectura en AWS.
+- **Protección del endpoint público:** un token en el QR y límites por
+  celular (2 compras por segundo) y por IP (40, porque toda un aula sale
+  por la misma IP).
+- **No es parte de lo que se mide:** la carga de la evaluación la genera el
+  loadgen; el gateway existe solo en el perfil `demo` del Compose.
+
+---
 
 ## Anexo: el código del tiempo real
 
