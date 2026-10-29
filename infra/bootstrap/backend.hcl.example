@@ -1,0 +1,7 @@
+# Copiar a backend.hcl (que NO se versiona) y completar el bucket con el
+# output `bucket_state`. Se usa con:
+#   terraform init -migrate-state -backend-config=backend.hcl
+bucket       = "drts-tfstate-<numero-de-cuenta>"
+key          = "bootstrap/terraform.tfstate"
+region       = "us-east-1"
+use_lockfile = true
