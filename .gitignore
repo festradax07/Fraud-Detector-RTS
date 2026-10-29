@@ -21,3 +21,15 @@
 
 # Registro de auditoría (archivos JSONL que escribe eventos -rol auditoria)
 /auditoria/
+
+# Terraform (el repo es público): el state vive en S3 y puede tener datos
+# sensibles; las variables locales tampoco se versionan. El lock de los
+# providers (.terraform.lock.hcl) SÍ se versiona.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+*.tfplan
+backend.hcl
