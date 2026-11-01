@@ -48,6 +48,7 @@ escriben: [ADR-0001](0001-registrar-decisiones-con-adrs.md) y la
 | [0027](0027-reintento-responde-lo-registrado.md) | Un reintento responde lo registrado; sin registro no hay decisión | Aceptada (reemplaza parte de 0012) | corrección posterior a la 8 |
 | [0028](0028-metricas-de-evaluacion-sli-slo-sla.md) | Métricas de evaluación y objetivos (SLI, SLO y SLA) | Aceptada | transversal (evaluación por entornos) |
 | [0029](0029-demo-interactiva-y-bloqueo-automatico.md) | Demo interactiva con QR y bloqueo automático de tarjetas | Aceptada | demo de la presentación |
+| [0030](0030-balanceo-en-la-infraestructura.md) | El balanceo entre réplicas del motor es de la infraestructura (ALB), no de la aplicación | Aceptada | 7.6 (nube, Fase 2) |
 
 ## Cómo leerlos
 
@@ -59,4 +60,4 @@ escriben: [ADR-0001](0001-registrar-decisiones-con-adrs.md) y la
   0010 (scoring).
 - **Medir y operar:** 0014 (load generator), 0026 (perfil de carga diario), 0028 (métricas oficiales y SLOs), 0015 (observabilidad), 0016
   (tests reales), 0017 (configuración y apagado), 0018 (entornos), 0019
-  (Kafka), 0020 (imágenes, salud y Compose), 0021 (logs), 0023 (redes), 0024 (eventos), 0025 (consumidores y auditoría).
+  (Kafka), 0020 (imágenes, salud y Compose), 0021 (logs), 0023 (redes), 0024 (eventos), 0025 (consumidores y auditoría), 0030 (balanceo en la infraestructura).

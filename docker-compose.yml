@@ -41,6 +41,12 @@ networks:
 
 # Las mismas imágenes en todos los entornos: se construyen desde el mismo
 # Dockerfile, eligiendo la etapa final con target.
+#
+# De dónde salen: sin variables, se construyen acá (drts/<servicio>:dev).
+# Para usar las publicadas por GitHub Actions (el artefacto que va a AWS):
+#
+#   DRTS_IMAGENES=ghcr.io/festradax07/fraud-detector-rts DRTS_TAG=sha-<commit> \
+#     docker compose --profile sistema up -d --pull always --no-build
 x-build: &build
   context: .
   dockerfile: Dockerfile
@@ -78,7 +84,7 @@ services:
     profiles: [sistema]
     networks: [datos]
     build: { <<: *build, target: cargar-stats }
-    image: drts/cargar-stats:dev
+    image: ${DRTS_IMAGENES:-drts}/cargar-stats:${DRTS_TAG:-dev}
     command: ["-csv", "/app/data/fraudTrain.csv", "-redis", "redis:6379", "-blacklist", "demo-robada"]
     volumes:
       - ./data:/app/data:ro # el dataset NO va en la imagen
@@ -90,7 +96,7 @@ services:
     profiles: [sistema]
     networks: [aplicacion, datos]
     build: { <<: *build, target: settlement }
-    image: drts/settlement:dev
+    image: ${DRTS_IMAGENES:-drts}/settlement:${DRTS_TAG:-dev}
     environment:
       REDIS_ADDR: redis:6379
       KAFKA_BROKERS: kafka:29092 # listener INTERNO (ver el servicio kafka)
@@ -110,7 +116,7 @@ services:
     profiles: [sistema]
     networks: [aplicacion, datos]
     build: { <<: *build, target: fraud-engine }
-    image: drts/fraud-engine:dev
+    image: ${DRTS_IMAGENES:-drts}/fraud-engine:${DRTS_TAG:-dev}
     environment:
       REDIS_ADDR: redis:6379
       SETTLEMENT_ADDR: settlement:50052
@@ -204,7 +210,7 @@ services:
     logging: *logging
     profiles: [sistema]
     build: { <<: *build, target: eventos }
-    image: drts/eventos:dev
+    image: ${DRTS_IMAGENES:-drts}/eventos:${DRTS_TAG:-dev}
     command: ["-rol", "auditoria", "-dir", "/app/auditoria"]
     environment: { KAFKA_BROKERS: "kafka:29092" }
     # Registro durable: un archivo JSONL por día, en ./auditoria (fuera de
@@ -219,7 +225,7 @@ services:
   eventos-alertas:
     logging: *logging
     profiles: [sistema]
-    image: drts/eventos:dev
+    image: ${DRTS_IMAGENES:-drts}/eventos:${DRTS_TAG:-dev}
     pull_policy: never # la imagen la construye eventos-auditoria; no buscarla en Docker Hub
     command: ["-rol", "alertas"]
     environment:
@@ -236,7 +242,7 @@ services:
   eventos-estadisticas:
     logging: *logging
     profiles: [sistema]
-    image: drts/eventos:dev
+    image: ${DRTS_IMAGENES:-drts}/eventos:${DRTS_TAG:-dev}
     pull_policy: never # la imagen la construye eventos-auditoria; no buscarla en Docker Hub
     command: ["-rol", "estadisticas"]
     environment: { KAFKA_BROKERS: "kafka:29092", REDIS_ADDR: "redis:6379" }
@@ -252,7 +258,7 @@ services:
     profiles: [carga]
     networks: [aplicacion]
     build: { <<: *build, target: loadgen }
-    image: drts/loadgen:dev
+    image: ${DRTS_IMAGENES:-drts}/loadgen:${DRTS_TAG:-dev}
     # El target va fijo en el entrypoint; los argumentos de "run" reemplazan
     # solo al command (ver el ejemplo de arriba, con los dos perfiles)
     entrypoint: ["/loadgen", "-target", "fraud-engine:50051"]
@@ -278,7 +284,7 @@ services:
     profiles: [demo]
     networks: [aplicacion]
     build: { <<: *build, target: gateway }
-    image: drts/gateway:dev
+    image: ${DRTS_IMAGENES:-drts}/gateway:${DRTS_TAG:-dev}
     pull_policy: never
     environment:
       MOTOR_ADDR: fraud-engine:50051

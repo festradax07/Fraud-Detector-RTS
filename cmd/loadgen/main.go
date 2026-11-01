@@ -42,12 +42,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
 	"fd_rts/internal/fallas"
 	"fd_rts/internal/metricas"
 	"fd_rts/internal/registro"
+	"fd_rts/internal/servicio"
 	pb "fd_rts/proto"
 )
 
@@ -262,6 +262,7 @@ func main() {
 	deadline := flag.Duration("deadline", 200*time.Millisecond, "deadline de cada transacción")
 	rutaCSV := flag.String("csv", "data/fraudTest.csv", "dataset de donde salen las transacciones")
 	target := flag.String("target", "localhost:50051", "dirección del Fraud-Engine")
+	rutaCA := flag.String("ca", "", "certificado PEM de la autoridad del balanceador (vacío: sin TLS, local)")
 	maxIntentos := flag.Int("intentos", 3, "máximo de intentos ante resultado ambiguo")
 	semilla := flag.Uint64("semilla", 1, "semilla del generador de llegadas (reproducible)")
 	salida := flag.String("salida", "", "CSV de resultados (default: resultados/loadgen-<modo>-<hora>.csv)")
@@ -315,7 +316,11 @@ func main() {
 
 	// Una sola conexión: HTTP/2 multiplexa todas las requests concurrentes
 	// sobre ella.
-	conn, err := grpc.NewClient(*target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	cred, err := servicio.CredencialesCliente(*rutaCA)
+	if err != nil {
+		registro.Fatal("credenciales del motor", "error", err)
+	}
+	conn, err := grpc.NewClient(*target, cred)
 	if err != nil {
 		registro.Fatal("cliente gRPC", "error", err)
 	}
