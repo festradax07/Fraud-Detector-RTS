@@ -1,0 +1,8 @@
+# Copiar a terraform.tfvars (que NO se versiona: está en el .gitignore) y
+# completar. Terraform lo carga solo al correr plan/apply en esta carpeta.
+
+email_alertas = "tu-mail@ejemplo.com"
+
+# Opcionales (tienen valor por defecto):
+# presupuesto_usd = "10"
+# region          = "us-east-1"

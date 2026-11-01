@@ -6,10 +6,15 @@ vive en `infra/entornos/fase1`.
 
 ```sh
 cd infra/bootstrap
+cp terraform.tfvars.example terraform.tfvars   # y completar el mail
 terraform init
-terraform plan  -var 'email_alertas=TU_MAIL'
-terraform apply -var 'email_alertas=TU_MAIL'
+terraform plan
+terraform apply
 ```
+
+`terraform.tfvars` es **privado** (está en el `.gitignore`): ahí va el mail,
+y Terraform lo carga solo. En el repo queda `terraform.tfvars.example` como
+plantilla.
 
 Avisa por mail al 50% y al 80% del tope del mes (por defecto, $10), y si el
 pronóstico del mes lo supera. Las alertas llegan por mail directo, sin
