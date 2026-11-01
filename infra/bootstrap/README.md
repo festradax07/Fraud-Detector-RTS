@@ -1,45 +1,33 @@
 # Bootstrap de AWS
 
-Lo que tiene que existir antes que cualquier entorno: la **alarma de
-presupuesto**, el **bucket del state** de Terraform y el **bucket de datos**
-(el dataset). Se aplica **una sola vez**, desde la notebook, con las
-credenciales de administrador.
-
-## Primera vez
+Lo único permanente del proyecto: la **alarma de presupuesto** (gratis).
+Se aplica **una sola vez**, desde la notebook. Todo lo demás es efímero y
+vive en `infra/entornos/fase1`.
 
 ```sh
 cd infra/bootstrap
+cp terraform.tfvars.example terraform.tfvars   # y completar el mail
 terraform init
-terraform plan  -var 'email_alertas=TU_MAIL'
-terraform apply -var 'email_alertas=TU_MAIL'
+terraform plan
+terraform apply
 ```
 
-Las alertas de presupuesto llegan por mail directo (no hace falta
-confirmar ninguna suscripción). Si no aparecen cuando corresponde, revisar
-la carpeta de spam.
+`terraform.tfvars` es **privado** (está en el `.gitignore`): ahí va el mail,
+y Terraform lo carga solo. En el repo queda `terraform.tfvars.example` como
+plantilla.
 
-## Mover este state al bucket (el huevo y la gallina)
+Avisa por mail al 50% y al 80% del tope del mes (por defecto, $10), y si el
+pronóstico del mes lo supera. Las alertas llegan por mail directo, sin
+confirmar ninguna suscripción; si no aparecen, revisar el spam.
 
-Este state arranca local, porque el bucket todavía no existía. Una vez
-creado:
+## El state es local
 
-1. Crear `backend.hcl` (no se versiona: el nombre del bucket lleva el
-   número de cuenta y el repo es público), copiando `backend.hcl.example`
-   y poniendo el nombre que devuelve `terraform output bucket_state`.
-2. En `main.tf`, descomentar la línea `backend "s3" {}`.
-3. `terraform init -migrate-state -backend-config=backend.hcl` (responder
-   `yes`).
-4. Borrar los `terraform.tfstate*` locales (ya están en el bucket).
+Terraform lo maneja una sola persona, así que el state queda en esta carpeta
+(`terraform.tfstate`), sin bucket: no hay que compartirlo ni bloquearlo.
 
-## Subir el dataset
-
-```sh
-aws s3 cp data/fraudTrain.csv s3://$(terraform output -raw bucket_datos)/data/
-aws s3 cp data/fraudTest.csv  s3://$(terraform output -raw bucket_datos)/data/
-```
-
-## Qué cuesta
-
-Casi nada: la alarma de presupuesto es gratis, y los buckets con ~500MB
-cuestan centavos por mes. El bucket del state tiene `prevent_destroy`: es lo
-único que no se borra al terminar.
+- **No va a git** (está en el `.gitignore`): puede tener datos sensibles.
+- **Conviene un backup.** Si se pierde, la alarma sigue existiendo en AWS,
+  pero Terraform se olvida de ella (se borra a mano desde la consola, en
+  Billing → Budgets).
+- Todo lo del proyecto lleva la etiqueta `proyecto=drts`, para encontrarlo
+  aunque se pierda un state.

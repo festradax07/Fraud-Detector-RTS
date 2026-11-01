@@ -1,0 +1,49 @@
+#!/bin/bash
+# Arranque de la EC2 de la Fase 1 (user data). Lo corre cloud-init UNA vez,
+# como root, al crear la instancia. Plantilla de Terraform: lo que va entre
+# $${ } lo completa Terraform; el resto es bash.
+#
+# Sin "set -x" a propósito: mostraría cada comando con sus valores (el token
+# de la demo) en el log, que se puede leer desde la consola de AWS.
+set -euo pipefail
+exec > >(tee -a /var/log/drts-arranque.log) 2>&1
+paso() { echo "[drts $(date +%H:%M:%S)] $*"; }
+
+%{ if horas_maximas > 0 ~}
+# Red de seguridad de costo: apagarse (= borrarse) a las ${horas_maximas} h.
+shutdown -h +${horas_maximas * 60} "drts: tiempo máximo de la sesión" || true
+paso "apagado automático programado en ${horas_maximas} h"
+%{ endif ~}
+
+paso "instalando Docker, Compose, git y make"
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -q
+apt-get install -y -q docker.io docker-compose-v2 docker-buildx git make
+snap install aws-cli --classic
+systemctl enable --now docker
+usermod -aG docker ubuntu
+
+paso "clonando el repo (${git_ref})"
+git clone --depth 1 --branch "${git_ref}" "${repo_url}" /opt/drts
+cd /opt/drts
+mkdir -p data auditoria resultados
+
+paso "bajando el dataset del bucket"
+/snap/bin/aws s3 cp "s3://${bucket}/data/" data/ --recursive --no-progress
+
+# Variables del Compose (DEMO_TOKEN, DEMO_PUERTO, el usuario de los archivos
+# que escriben los contenedores). Archivo privado: solo root lo lee.
+cat > .env <<EOF
+DEMO_TOKEN=${demo_token}
+DEMO_PUERTO=${demo_puerto}
+DRTS_UID=1000
+DRTS_GID=1000
+EOF
+chmod 600 .env
+chown -R 1000:1000 data auditoria resultados
+
+paso "construyendo y levantando el sistema y la demo (make demo-up)"
+docker compose --profile sistema --profile demo up -d --build --wait
+
+touch /opt/drts/LISTO
+paso "LISTO: demo en el puerto ${demo_puerto}"

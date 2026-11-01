@@ -1,15 +1,18 @@
-# Bootstrap: lo que tiene que existir ANTES que cualquier entorno, y que se
-# aplica una sola vez, desde la notebook (ADR-0030).
+# Bootstrap: lo que tiene que existir antes que cualquier entorno, y que
+# queda siempre. Se aplica una sola vez, desde la notebook.
 #
-#   1. La alarma de presupuesto: lo primero, antes de crear nada que cueste.
-#   2. El bucket del state de Terraform: privado, versionado y cifrado.
-#   3. El bucket de datos: el dataset (~500MB, no está en git) para la EC2.
+# Es solo la alarma de presupuesto (gratis): lo primero, antes de crear nada
+# que cueste. Todo lo demás (la red, la EC2, el bucket con el dataset) es
+# efímero y vive en infra/entornos/fase1: se crea para la sesión y se
+# destruye al terminar.
 #
-# El huevo y la gallina: este state arranca local (no hay bucket todavía) y
-# después se migra al bucket que crea (ver README.md de esta carpeta).
+# State LOCAL, sin backend: Terraform lo maneja una sola persona, así que no
+# hace falta compartir ni bloquear el state (lo que resuelve un bucket). El
+# terraform.tfstate queda en esta carpeta, fuera de git (.gitignore), y
+# conviene tener un backup.
 
 terraform {
-  required_version = ">= 1.10" # use_lockfile: el lock del state en S3, sin DynamoDB
+  required_version = ">= 1.10"
 
   required_providers {
     aws = {
@@ -17,12 +20,6 @@ terraform {
       version = ">= 5.0"
     }
   }
-
-  # Después de la primera aplicación, descomentar y correr
-  # `terraform init -migrate-state -backend-config=backend.hcl`.
-  # El bucket y la key van en backend.hcl (no se versiona: el nombre del
-  # bucket lleva el número de cuenta, y el repo es público). Ver README.md.
-  # backend "s3" {}
 }
 
 provider "aws" {
@@ -31,16 +28,6 @@ provider "aws" {
     tags = { proyecto = "drts", parte = "bootstrap", gestionado_por = "terraform" }
   }
 }
-
-# La cuenta: los nombres de bucket son globales en todo S3, así que llevan el
-# número de cuenta para no chocar con los de nadie más.
-data "aws_caller_identity" "actual" {}
-
-locals {
-  cuenta = data.aws_caller_identity.actual.account_id
-}
-
-# ------------------------------------------------------------ presupuesto
 
 resource "aws_budgets_budget" "mensual" {
   name         = "drts-mensual"
@@ -69,64 +56,5 @@ resource "aws_budgets_budget" "mensual" {
     threshold_type             = "PERCENTAGE"
     notification_type          = "FORECASTED"
     subscriber_email_addresses = [var.email_alertas]
-  }
-}
-
-# ----------------------------------------------------------------- buckets
-
-resource "aws_s3_bucket" "state" {
-  bucket = "drts-tfstate-${local.cuenta}"
-  # Sin este bucket Terraform no sabe qué creó ni qué destruir.
-  lifecycle {
-    prevent_destroy = true
-  }
-}
-
-resource "aws_s3_bucket" "datos" {
-  bucket = "drts-datos-${local.cuenta}"
-}
-
-# Versionado del state: si un apply lo deja mal, se recupera la versión
-# anterior.
-resource "aws_s3_bucket_versioning" "state" {
-  bucket = aws_s3_bucket.state.id
-  versioning_configuration {
-    status = "Enabled"
-  }
-}
-
-# Los dos buckets: privados (sin acceso público de ninguna forma) y
-# cifrados en reposo.
-resource "aws_s3_bucket_public_access_block" "privado" {
-  for_each = { state = aws_s3_bucket.state.id, datos = aws_s3_bucket.datos.id }
-
-  bucket                  = each.value
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-resource "aws_s3_bucket_server_side_encryption_configuration" "cifrado" {
-  for_each = { state = aws_s3_bucket.state.id, datos = aws_s3_bucket.datos.id }
-
-  bucket = each.value
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
-    }
-  }
-}
-
-# Las versiones viejas del state no tienen que quedar para siempre.
-resource "aws_s3_bucket_lifecycle_configuration" "state" {
-  bucket = aws_s3_bucket.state.id
-  rule {
-    id     = "versiones-viejas"
-    status = "Enabled"
-    filter {}
-    noncurrent_version_expiration {
-      noncurrent_days = 90
-    }
   }
 }

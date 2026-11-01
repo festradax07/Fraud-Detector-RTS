@@ -1,0 +1,11 @@
+# Copiar a terraform.tfvars (que NO se versiona: está en el .gitignore) y
+# completar. Terraform lo carga solo al correr plan/apply en esta carpeta.
+
+# Token de la demo: va en el QR. Al menos 12 caracteres (letras, números o
+# guiones). Uno nuevo por presentación, por ejemplo: openssl rand -hex 8
+demo_token = "cambiar-este-token"
+
+# Opcionales (tienen valor por defecto):
+# tipo_instancia = "c7i.xlarge"
+# horas_maximas  = 4          # se apaga y se borra sola después de esto
+# git_ref        = "main"
