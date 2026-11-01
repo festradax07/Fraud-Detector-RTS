@@ -1,0 +1,69 @@
+# Fase 2, rol DATOS: Redis y Settlement, en su propia máquina (ADR-0031).
+#
+# Los cuatro roles (datos, motor, frio, borde) son el mismo sistema que el
+# docker-compose.yml de la raíz, partido en máquinas. Diferencias:
+#
+# - Las imágenes NO se construyen: se bajan de GHCR, publicadas por GitHub
+#   Actions (el mismo artefacto en todos los entornos, ADR-0018). DRTS_TAG es
+#   obligatorio: sha-<commit>, para saber exactamente qué corre.
+# - Los servicios se encuentran por DNS (zona privada drts.internal de
+#   Route 53), no por nombre de contenedor: están en máquinas distintas.
+# - Red "host": cada contenedor usa directamente la interfaz de la máquina,
+#   sin el bridge ni el NAT de Docker (un salto menos, y la dirección que
+#   anuncia un servicio es la de la máquina). Es lo mismo que hace ECS con
+#   awsvpc. El aislamiento entre roles lo dan los security groups (ADR-0023),
+#   no las redes de Docker.
+#
+# Uso (lo hace el arranque de la máquina): docker compose -f datos.yml up -d
+name: drts-datos
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }
+
+services:
+  redis:
+    logging: *logging
+    network_mode: host
+    image: redis:8.10.2
+    # Sin snapshots (ver el compose de la raíz). --protected-mode no: por
+    # defecto, sin contraseña, Redis solo acepta conexiones de localhost; acá
+    # lo usan el motor y los consumidores desde otras máquinas. Quién puede
+    # llegar al 6379 lo decide el security group.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--protected-mode", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+    restart: unless-stopped
+
+  # Corre una vez y termina: las estadísticas del Z-score y la tarjeta robada
+  # de la demo.
+  cargar-stats:
+    logging: *logging
+    network_mode: host
+    image: ${DRTS_IMAGENES:-ghcr.io/festradax07/fraud-detector-rts}/cargar-stats:${DRTS_TAG:?falta DRTS_TAG (sha-<commit>)}
+    command: ["-csv", "/app/data/fraudTrain.csv", "-redis", "redis.drts.internal:6379", "-blacklist", "demo-robada"]
+    volumes:
+      - ../../../../data:/app/data:ro
+    depends_on:
+      redis: { condition: service_healthy }
+
+  settlement:
+    logging: *logging
+    network_mode: host
+    image: ${DRTS_IMAGENES:-ghcr.io/festradax07/fraud-detector-rts}/settlement:${DRTS_TAG:?falta DRTS_TAG (sha-<commit>)}
+    environment:
+      REDIS_ADDR: redis.drts.internal:6379
+      KAFKA_BROKERS: kafka.drts.internal:9092
+      LOG_NIVEL: info
+    healthcheck:
+      test: ["CMD", "/salud", "-addr", "localhost:50052"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 5s
+    depends_on:
+      redis: { condition: service_healthy }
+    restart: unless-stopped

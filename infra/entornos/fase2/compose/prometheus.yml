@@ -1,0 +1,29 @@
+# Prometheus de la Fase 2: corre en la máquina "frio" y scrapea las otras por
+# su nombre en la zona privada drts.internal. Cada réplica del motor por
+# separado (no por el ALB): el dashboard tiene que ver cada una.
+global:
+  scrape_interval: 1s
+  evaluation_interval: 1s
+
+scrape_configs:
+  - job_name: fraud_engine
+    static_configs:
+      - targets: ["motor-1.drts.internal:2112", "motor-2.drts.internal:2112"]
+        labels: { entorno: aws }
+  - job_name: settlement
+    static_configs:
+      - targets: ["settlement.drts.internal:2113"]
+        labels: { entorno: aws }
+  # Los consumidores corren en esta misma máquina.
+  - job_name: eventos
+    static_configs:
+      - targets: ["localhost:2115", "localhost:2117", "localhost:2118"]
+        labels: { entorno: aws }
+  - job_name: gateway
+    static_configs:
+      - targets: ["borde.drts.internal:2116"]
+        labels: { entorno: aws }
+  - job_name: loadgen
+    static_configs:
+      - targets: ["borde.drts.internal:2114"]
+        labels: { entorno: aws }

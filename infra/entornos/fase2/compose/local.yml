@@ -1,0 +1,30 @@
+# Para probar los cuatro roles JUNTOS en la notebook, antes de gastar en AWS.
+# No se usa en AWS. Junta los cuatro archivos en un solo proyecto y hace que
+# los nombres de drts.internal apunten a la propia notebook:
+#
+#   cd infra/entornos/fase2/compose
+#   DRTS_TAG=dev DRTS_IMAGENES=drts DRTS_MOTOR=motor-1.drts.internal:50051 \
+#   DRTS_MOTOR_CA= DEMO_TOKEN=demo-local DEMO_PUERTO=8080 \
+#     docker compose -p drts-fase2 -f datos.yml -f motor.yml -f frio.yml -f borde.yml -f local.yml up -d
+#
+# (una sola réplica del motor, sin ALB ni TLS: el gateway le habla directo)
+x-nombres: &nombres
+  extra_hosts:
+    - "redis.drts.internal:127.0.0.1"
+    - "settlement.drts.internal:127.0.0.1"
+    - "kafka.drts.internal:127.0.0.1"
+    - "motor-1.drts.internal:127.0.0.1"
+    - "borde.drts.internal:127.0.0.1"
+
+services:
+  cargar-stats: *nombres
+  settlement: *nombres
+  fraud-engine: *nombres
+  kafka: *nombres
+  kafka-topics: *nombres
+  eventos-auditoria: *nombres
+  eventos-alertas: *nombres
+  eventos-estadisticas: *nombres
+  prometheus: *nombres
+  gateway: *nombres
+  loadgen: *nombres

@@ -1,0 +1,47 @@
+# Fase 2, rol BORDE: los clientes del motor. El gateway de la demo (lo único
+# abierto a internet) y el load generator. Le hablan al motor a través del
+# ALB interno, por TLS con la autoridad propia (ADR-0030). Convenciones: ver
+# datos.yml.
+#
+#   docker compose -f borde.yml up -d                       # el gateway
+#   docker compose -f borde.yml run --rm loadgen -rps 200   # una corrida
+name: drts-borde
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }
+
+# Dónde está el motor y con qué autoridad verificarlo. En AWS: el ALB.
+x-motor: &motor
+  MOTOR_ADDR: ${DRTS_MOTOR:-motor.drts.internal:443}
+  MOTOR_CA: ${DRTS_MOTOR_CA-/certs/ca.pem}
+
+services:
+  gateway:
+    logging: *logging
+    network_mode: host
+    image: ${DRTS_IMAGENES:-ghcr.io/festradax07/fraud-detector-rts}/gateway:${DRTS_TAG:?falta DRTS_TAG (sha-<commit>)}
+    environment:
+      <<: *motor
+      # El 80 es un puerto privilegiado: el arranque de la máquina habilita
+      # los puertos desde el 80 para usuarios sin privilegios (sysctl
+      # net.ipv4.ip_unprivileged_port_start), y la imagen sigue sin ser root.
+      GATEWAY_ADDR: ":${DEMO_PUERTO:-80}"
+      DEMO_TOKEN: ${DEMO_TOKEN:?falta DEMO_TOKEN}
+    volumes:
+      - ${DRTS_CERTS:-/opt/drts/certs}:/certs:ro
+    restart: unless-stopped
+
+  loadgen:
+    logging: *logging
+    profiles: [carga]
+    network_mode: host
+    image: ${DRTS_IMAGENES:-ghcr.io/festradax07/fraud-detector-rts}/loadgen:${DRTS_TAG:?falta DRTS_TAG (sha-<commit>)}
+    entrypoint: ["/loadgen", "-target", "${DRTS_MOTOR:-motor.drts.internal:443}", "-ca", "${DRTS_MOTOR_CA-/certs/ca.pem}"]
+    command: ["-modo", "nominal"]
+    user: "${DRTS_UID:-1000}:${DRTS_GID:-1000}"
+    volumes:
+      - ${DRTS_CERTS:-/opt/drts/certs}:/certs:ro
+      - ../../../../data:/app/data:ro
+      - ../../../../perfiles:/app/perfiles:ro
+      - ../../../../resultados:/app/resultados

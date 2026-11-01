@@ -1,0 +1,135 @@
+# Fase 2, rol FRÍO: Kafka, los consumidores del cold path y la
+# observabilidad (Prometheus + Grafana). Nada de esta máquina está en el
+# camino de decisión: si se cae, las transacciones siguen (ADR-0019).
+# Convenciones: ver datos.yml.
+name: drts-frio
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }
+
+services:
+  kafka:
+    logging: *logging
+    network_mode: host
+    image: apache/kafka:4.3.1
+    environment:
+      CLUSTER_ID: S-4cvdehRVSIGIbYBnJv3g
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      # UN listener de clientes, anunciado con el nombre DNS: después del
+      # primer contacto, el broker le dice a cada cliente "conectate a
+      # kafka.drts.internal:9092". Tiene que ser una dirección que las OTRAS
+      # máquinas puedan resolver y alcanzar (con localhost, el motor se
+      # conectaría a sí mismo). El controller queda solo en localhost.
+      KAFKA_LISTENERS: CLIENTES://:9092,CONTROLLER://localhost:9093
+      KAFKA_ADVERTISED_LISTENERS: CLIENTES://kafka.drts.internal:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CLIENTES:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: CLIENTES
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_HEAP_OPTS: "-Xms1g -Xmx1g"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 15s
+    restart: unless-stopped
+
+  kafka-topics:
+    logging: *logging
+    network_mode: host
+    image: apache/kafka:4.3.1
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        for t in drts.transacciones.evaluadas drts.transacciones.liquidadas; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --if-not-exists \
+            --topic "$$t" --partitions 3 --replication-factor 1 --config retention.ms=604800000 || exit 1
+        done
+    depends_on:
+      kafka: { condition: service_healthy }
+
+  # Los tres consumidores comparten la máquina (y la red host): cada uno
+  # expone /metrics en su propio puerto.
+  eventos-auditoria:
+    logging: *logging
+    network_mode: host
+    image: ${DRTS_IMAGENES:-ghcr.io/festradax07/fraud-detector-rts}/eventos:${DRTS_TAG:?falta DRTS_TAG (sha-<commit>)}
+    command: ["-rol", "auditoria", "-dir", "/app/auditoria", "-metricas", ":2115"]
+    environment: { KAFKA_BROKERS: "kafka.drts.internal:9092" }
+    user: "${DRTS_UID:-1000}:${DRTS_GID:-1000}"
+    volumes:
+      - ../../../../auditoria:/app/auditoria
+    depends_on:
+      kafka-topics: { condition: service_completed_successfully }
+    restart: unless-stopped
+
+  eventos-alertas:
+    logging: *logging
+    network_mode: host
+    image: ${DRTS_IMAGENES:-ghcr.io/festradax07/fraud-detector-rts}/eventos:${DRTS_TAG:?falta DRTS_TAG (sha-<commit>)}
+    command: ["-rol", "alertas", "-metricas", ":2117"]
+    environment:
+      KAFKA_BROKERS: "kafka.drts.internal:9092"
+      REDIS_ADDR: "redis.drts.internal:6379"
+      BLOQUEO_AUTOMATICO: "CARD_TESTING,VIAJE_IMPOSIBLE"
+    depends_on:
+      kafka-topics: { condition: service_completed_successfully }
+    restart: unless-stopped
+
+  eventos-estadisticas:
+    logging: *logging
+    network_mode: host
+    image: ${DRTS_IMAGENES:-ghcr.io/festradax07/fraud-detector-rts}/eventos:${DRTS_TAG:?falta DRTS_TAG (sha-<commit>)}
+    command: ["-rol", "estadisticas", "-metricas", ":2118"]
+    environment: { KAFKA_BROKERS: "kafka.drts.internal:9092", REDIS_ADDR: "redis.drts.internal:6379" }
+    depends_on:
+      kafka-topics: { condition: service_completed_successfully }
+    restart: unless-stopped
+
+  # Prometheus y Grafana escuchan SOLO en localhost de esta máquina: se ven
+  # desde la notebook con un túnel de SSM (como en la Fase 1).
+  prometheus:
+    logging: *logging
+    network_mode: host
+    image: prom/prometheus:v3.15.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+      - --web.listen-address=127.0.0.1:9090
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-datos:/prometheus
+    restart: unless-stopped
+
+  grafana:
+    logging: *logging
+    network_mode: host
+    image: grafana/grafana:13.2.3
+    environment:
+      GF_SERVER_HTTP_ADDR: 127.0.0.1
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_DASHBOARDS_MIN_REFRESH_INTERVAL: 1s
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/drts.json
+    # El datasource provisionado apunta a http://prometheus:9090 (el nombre
+    # en el compose de la raíz). Con red host, ese nombre es esta máquina.
+    extra_hosts:
+      - "prometheus:127.0.0.1"
+    volumes:
+      - ../../../../observabilidad/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../../../../observabilidad/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  prometheus-datos: {}
