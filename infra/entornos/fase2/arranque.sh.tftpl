@@ -1,0 +1,84 @@
+#!/bin/bash
+# Arranque de una máquina de la Fase 2 (user data): rol ${rol}, nombre
+# ${nombre}. Lo corre cloud-init UNA vez, como root, al crear la instancia.
+# Plantilla de Terraform: lo que va entre $${ } lo completa Terraform.
+#
+# No construye nada: baja las imágenes de GHCR (${drts_tag}) y levanta
+# solo su rol (infra/entornos/fase2/compose/${rol}.yml).
+#
+# Sin "set -x" a propósito: en el borde imprimiría el token de la demo.
+set -euo pipefail
+exec > >(tee -a /var/log/drts-arranque.log) 2>&1
+paso() { echo "[drts ${nombre} $(date +%H:%M:%S)] $*"; }
+
+%{ if horas_maximas > 0 ~}
+shutdown -h +${horas_maximas * 60} "drts: tiempo máximo de la sesión" || true
+paso "apagado automático programado en ${horas_maximas} h"
+%{ endif ~}
+
+paso "instalando Docker, Compose y git"
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -q
+apt-get install -y -q docker.io docker-compose-v2 git make
+systemctl enable --now docker
+usermod -aG docker ubuntu
+
+# El repo trae los compose por rol, la configuración de Prometheus y
+# Grafana y los perfiles de carga. El código NO se compila acá.
+paso "clonando el repo (${git_ref})"
+git clone --depth 1 --branch "${git_ref}" "${repo_url}" /opt/drts
+cd /opt/drts
+mkdir -p data auditoria resultados certs
+
+%{ if rol == "datos" || rol == "borde" ~}
+# cargar-stats (datos) y el loadgen (borde) leen el dataset.
+paso "bajando el dataset del bucket"
+snap install aws-cli --classic
+/snap/bin/aws s3 cp "s3://${bucket}/data/" data/ --recursive --no-progress
+%{ endif ~}
+
+%{ if rol == "borde" ~}
+# La autoridad del ALB: el gateway y el loadgen verifican con ella el
+# certificado de motor.drts.internal (ADR-0030).
+cat > certs/ca.pem <<'PEM'
+${ca_pem}PEM
+
+# El gateway escucha en el ${demo_puerto} sin ser root: con red host, este
+# ajuste de la máquina vale para el contenedor.
+echo "net.ipv4.ip_unprivileged_port_start=${demo_puerto}" > /etc/sysctl.d/90-drts.conf
+sysctl -q --system
+%{ endif ~}
+
+chown -R 1000:1000 data auditoria resultados certs
+
+# Variables del compose de este rol. Privado: solo root lo lee.
+cd /opt/drts/infra/entornos/fase2/compose
+cat > .env <<ENV
+DRTS_TAG=${drts_tag}
+DRTS_UID=1000
+DRTS_GID=1000
+%{ if rol == "borde" ~}
+DEMO_TOKEN=${demo_token}
+DEMO_PUERTO=${demo_puerto}
+%{ endif ~}
+ENV
+chmod 600 .env
+
+paso "bajando las imágenes de GHCR (${drts_tag})"
+docker compose -f ${rol}.yml pull --quiet
+
+# Las dependencias entre máquinas no se pueden expresar con depends_on: un
+# servicio que arranca antes que otro de otra máquina falla y Docker lo
+# reinicia. Se espera hasta que todo el rol esté sano (hasta ~15 min).
+paso "levantando el rol ${rol}"
+docker compose -f ${rol}.yml up -d
+for intento in $(seq 1 30); do
+  if docker compose -f ${rol}.yml up -d --wait --wait-timeout 30 > /dev/null 2>&1; then
+    touch /opt/drts/LISTO
+    paso "LISTO: rol ${rol} sano"
+    exit 0
+  fi
+  paso "esperando a que el rol esté sano (intento $intento)"
+done
+paso "ERROR: el rol no quedó sano; ver: docker compose -f ${rol}.yml ps"
+exit 1

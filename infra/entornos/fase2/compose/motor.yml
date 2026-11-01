@@ -1,0 +1,36 @@
+# Fase 2, rol MOTOR: una réplica del Fraud-Engine por máquina (dos o más),
+# detrás del ALB interno (ADR-0030). Convenciones: ver datos.yml.
+#
+# El ALB le manda requests al 50051 y le pregunta la salud por el mismo
+# puerto (grpc.health.v1.Health/Check). Prometheus scrapea cada réplica por
+# su nombre (motor-1, motor-2...), no por el ALB: tiene que ver cada una.
+name: drts-motor
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }
+
+services:
+  fraud-engine:
+    logging: *logging
+    network_mode: host
+    image: ${DRTS_IMAGENES:-ghcr.io/festradax07/fraud-detector-rts}/fraud-engine:${DRTS_TAG:?falta DRTS_TAG (sha-<commit>)}
+    environment:
+      REDIS_ADDR: redis.drts.internal:6379
+      SETTLEMENT_ADDR: settlement.drts.internal:50052
+      KAFKA_BROKERS: kafka.drts.internal:9092
+      LOG_NIVEL: info
+      # Al apagarse, NOT_SERVING durante unos segundos antes de dejar de
+      # atender: el health check del ALB lo saca de la rotación y las
+      # requests en vuelo terminan (ADR-0017).
+      APAGADO_AVISO: 5s
+    healthcheck:
+      test: ["CMD", "/salud", "-addr", "localhost:50051"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 5s
+    # Sin depends_on: Redis y Settlement están en otra máquina. Si el motor
+    # arranca antes que ellos, falla el PING a Redis, termina, y Docker lo
+    # vuelve a levantar hasta que estén.
+    restart: unless-stopped
