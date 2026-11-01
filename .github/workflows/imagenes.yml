@@ -1,0 +1,72 @@
+# Construye las imágenes de los servicios y las publica en GitHub Container
+# Registry (GHCR). Es EL artefacto: las mismas imágenes (el mismo digest)
+# corren en la notebook, en la Fase 1 y en la Fase 2 (ADR-0018). Nada se
+# construye en las máquinas de AWS: solo bajan lo que se publicó acá.
+#
+# Etiquetas de cada imagen:
+#   <rama>        la última de esa rama (main, feat-terraform-fase2, ...)
+#   sha-<commit>  fija: la que se usa para medir, porque no se mueve
+#
+# Corre en los runners de GitHub (gratis en un repo público): para publicar
+# alcanza con el GITHUB_TOKEN del propio workflow, sin credenciales de AWS.
+name: imagenes
+
+on:
+  push:
+    paths:
+      - "cmd/**"
+      - "internal/**"
+      - "proto/**"
+      - "go.mod"
+      - "go.sum"
+      - "Dockerfile"
+      - ".github/workflows/imagenes.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write # publicar en GHCR
+
+jobs:
+  imagen:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Las etapas finales del Dockerfile (una imagen por servicio).
+        target: [fraud-engine, settlement, loadgen, eventos, gateway, cargar-stats]
+    steps:
+      - uses: actions/checkout@v4
+
+      # GHCR exige el nombre en minúsculas (el repo es Fraud-Detector-RTS).
+      - name: Nombre de la imagen
+        run: echo "IMAGEN=ghcr.io/${GITHUB_REPOSITORY,,}/${{ matrix.target }}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGEN }}
+          tags: |
+            type=ref,event=branch
+            type=sha,format=short
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          platforms: linux/amd64 # las c7i de AWS y la notebook
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # La compilación de Go es la misma para todas: se cachea entre
+          # corridas en el caché de GitHub Actions.
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}

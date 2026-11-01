@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -109,12 +111,19 @@ func nuevoServerConRedis(t *testing.T) (*fraudEngineServer, *redis.Client, strin
 	if err != nil {
 		t.Fatalf("GuardarEstadisticas: %v", err)
 	}
-	return &fraudEngineServer{
+	s := &fraudEngineServer{
 		verificador: v,
 		settle:      levantarSettlement(t, settlement.NuevoServidor(rdb, prefijo, nil, 0)),
 		iteraciones: iteracionesPorDefecto,
-	}, rdb, prefijo
+	}
+	prefijos.Store(s, prefijo)
+	t.Cleanup(func() { prefijos.Delete(s) })
+	return s, rdb, prefijo
 }
+
+// prefijos: el prefijo de claves de cada server de prueba (para leer SU
+// registro en Redis y no el de otro test).
+var prefijos sync.Map
 
 // TestControlDeAdmision llama al handler directamente (sin red) con distintos
 // deadlines y verifica el código gRPC que devuelve.
@@ -393,20 +402,21 @@ func esperarEstado(t *testing.T, conn *grpc.ClientConn, want connectivity.State)
 // estadoRegistrado lee de Redis el estado que Settlement registró para txID.
 func estadoRegistrado(t *testing.T, s *fraudEngineServer, txID string) string {
 	t.Helper()
-	// El server de prueba y su Settlement comparten Redis y prefijo; el
-	// prefijo se recupera de una clave conocida del Verificador.
+	// El prefijo de ESTE server de prueba (lo anota nuevoServerConRedis). Antes
+	// se buscaba con un comodín ("test:*:settle:<tx>"), que podía devolver el
+	// registro de OTRO test con el mismo tx_id: go test ./... corre los
+	// paquetes en paralelo contra el mismo Redis (un test inestable).
+	prefijo, ok := prefijos.Load(s)
+	if !ok {
+		t.Fatal("server sin prefijo: armarlo con nuevoServerDePrueba o nuevoServerConRedis")
+	}
 	rdb := redisclient.Nuevo(pruebas.RedisAddr())
 	defer rdb.Close()
-	claves, err := rdb.Keys(context.Background(), "test:*:settle:"+txID).Result()
-	if err != nil {
-		t.Fatalf("buscando el registro: %v", err)
+	est, err := rdb.HGet(context.Background(), settlement.Clave(prefijo.(string), txID), "estado").Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		t.Fatalf("leyendo el registro: %v", err)
 	}
-	for _, c := range claves {
-		if est, err := rdb.HGet(context.Background(), c, "estado").Result(); err == nil && s != nil {
-			return est
-		}
-	}
-	return ""
+	return est
 }
 
 // Toda decisión pasa por Settlement y queda registrada.

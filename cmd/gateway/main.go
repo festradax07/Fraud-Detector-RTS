@@ -38,7 +38,6 @@ import (
 	qrcode "github.com/skip2/go-qrcode"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
 	"fd_rts/internal/config"
@@ -46,6 +45,7 @@ import (
 	"fd_rts/internal/metricas"
 	"fd_rts/internal/presupuesto"
 	"fd_rts/internal/registro"
+	"fd_rts/internal/servicio"
 	pb "fd_rts/proto"
 )
 
@@ -97,13 +97,18 @@ func main() {
 	}
 	addr := config.Texto("GATEWAY_ADDR", ":8080")
 	motorAddr := config.Texto("MOTOR_ADDR", "localhost:50051")
+	motorCA := config.Texto("MOTOR_CA", "") // vacío: sin TLS (local); en AWS, la autoridad del ALB
 	token := config.Texto("DEMO_TOKEN", "")
 	if token == "" {
 		// Sin token, cualquiera que encuentre la URL podría mandar tráfico.
 		registro.Fatal("falta DEMO_TOKEN (va en el QR)")
 	}
 
-	conn, err := grpc.NewClient(motorAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	cred, err := servicio.CredencialesCliente(motorCA)
+	if err != nil {
+		registro.Fatal("credenciales del motor", "error", err)
+	}
+	conn, err := grpc.NewClient(motorAddr, cred)
 	if err != nil {
 		registro.Fatal("cliente gRPC", "error", err)
 	}
