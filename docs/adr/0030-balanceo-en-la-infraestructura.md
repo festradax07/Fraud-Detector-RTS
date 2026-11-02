@@ -108,6 +108,52 @@ cada servicio: lo maneja un **plano de control** de la plataforma. Es decir,
 aun ahí la complejidad vive en la infraestructura. Un plano de control está
 fuera del alcance de este proyecto.
 
+### Envoy como sidecar en la máquina de los clientes
+
+*(Agregada el 2026-11-01, después de tomar la decisión: no la cambia, la
+refuerza.)*
+
+**Qué es Envoy:** un proxy de capa 7 de código abierto (CNCF), el que usan
+por debajo los *service mesh* como Istio. Entiende HTTP/2 y gRPC, así que
+reparte **por request** (como el ALB), hace health checks gRPC y no exige
+TLS.
+
+**Cómo sería:** un contenedor de Envoy en la máquina del borde, al lado del
+gateway y del load generator. Los clientes le hablan a `localhost:50051`
+sin TLS y Envoy reparte entre `motor-1` y `motor-2`, que encuentra por DNS.
+Desaparecen el ALB, el certificado y la subred de la segunda zona.
+
+- **A favor:**
+  - Sigue siendo balanceo de la infraestructura, transparente para la
+    aplicación: es la versión mínima del patrón *sidecar* de un service
+    mesh, sin plano de control.
+  - No hay salto extra por la red (el tramo cliente → Envoy queda dentro
+    de la máquina), así que probablemente sea más rápido que el ALB.
+  - No necesita TLS ni certificado, y como sidecar no cuesta nada.
+- **En contra, y por qué se descartó:** **no acompaña al auto scaling.**
+  El destino de los motores es escalar solos (un ASG o ECS), y ahí el
+  problema no es repartir sino **descubrir** las réplicas que aparecen y
+  desaparecen:
+  - **Registro:** con el ALB, el ASG anota cada instancia nueva en el
+    target group, automáticamente. Con Envoy, los registros DNS son fijos
+    (`motor-1`, `motor-2`): habría que armar el descubrimiento a mano
+    (Cloud Map, un script que actualice el DNS al crear o borrar cada
+    instancia, o un plano de control).
+  - **Métrica para escalar:** el ALB da **requests por réplica**
+    (`RequestCountPerTarget`), la señal que anticipa la saturación del
+    motor. Con Envoy quedaría la CPU, o exportar sus métricas a CloudWatch
+    a mano.
+  - **Operación:** la configuración de Envoy la escribimos y mantenemos
+    nosotros; el ALB lo opera AWS (alta disponibilidad incluida).
+
+  O sea: Envoy resuelve bien el balanceo con un número **fijo** de
+  réplicas, pero la integración ALB + ASG es justamente lo que costaría
+  construir a mano. Ese descubrimiento dinámico es el plano de control que
+  quedó fuera de alcance.
+
+**Envoy queda descartado para todo el diseño** (no se usa ni se mide):
+surgió como una consulta y se registra acá para dejar el porqué.
+
 ### Network Load Balancer (NLB)
 
 Más rápido y barato que el ALB (capa 4), pero reparte **conexiones**, no

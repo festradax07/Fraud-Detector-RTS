@@ -104,6 +104,23 @@ cd /opt/drts/infra/entornos/fase2/compose
 docker compose -f borde.yml run --rm loadgen -rps 200 -duracion 60s
 ```
 
+## Carga de fondo para la demo
+
+Mientras la clase compra desde los celulares, el loadgen sube la carga en
+escalera para que la latencia se vea crecer. Desde la raíz del repo, en la
+notebook:
+
+```sh
+scripts/demo-carga-aws.sh iniciar   # 30 → 60 → 90 → 110 → 130 RPS, 2 min cada uno
+scripts/demo-carga-aws.sh estado    # en qué escalón está
+scripts/demo-carga-aws.sh parar     # corta la carga
+```
+
+Corre en la máquina borde, desprendida de la sesión: sigue aunque se cierre
+la terminal, hasta el `parar`. Se ajusta con `ESCALONES="20 50 80"` y
+`DURACION=90s`. Referencia medida: con 2 motores, ~70 RPS dentro del SLO;
+a 100 el P99 ronda 110ms; desde 130 empieza el quiebre.
+
 ## Al terminar
 
 ```sh
