@@ -26,4 +26,11 @@ resource "aws_s3_object" "dataset" {
   key    = "data/${each.key}"
   source = "${path.module}/${var.ruta_datos}/${each.key}"
   etag   = filemd5("${path.module}/${var.ruta_datos}/${each.key}")
+
+  # Archivos grandes se suben en partes (multipart) y el ETag de S3 deja de
+  # ser el MD5 del archivo ("<md5 de las partes>-29"): sin esto, cada apply
+  # ve una diferencia y vuelve a subir los ~500MB. El dataset no cambia.
+  lifecycle {
+    ignore_changes = [etag]
+  }
 }

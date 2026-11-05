@@ -111,9 +111,17 @@ escalera para que la latencia se vea crecer. Desde la raíz del repo, en la
 notebook:
 
 ```sh
-scripts/demo-carga-aws.sh iniciar   # 30 → 60 → 90 → 110 → 130 RPS, 2 min cada uno
+scripts/demo-carga-aws.sh iniciar   # 30 → 60 → 90 → 130 → 200 RPS, 1 min cada uno
 scripts/demo-carga-aws.sh estado    # en qué escalón está
 scripts/demo-carga-aws.sh parar     # corta la carga
+```
+
+Para la presentación, directo al quiebre (con 2 motores: borde, quiebre y
+colapso), lanzando a la vez el `terraform apply` con `motor-3` descomentado
+en `computo.tf` para que la réplica llegue cuando ya colapsó:
+
+```sh
+ESCALONES="130 160 200" DURACION=90s scripts/demo-carga-aws.sh iniciar
 ```
 
 Corre en la máquina borde, desprendida de la sesión: sigue aunque se cierre

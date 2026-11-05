@@ -11,19 +11,20 @@
 # la máquina borde del output de Terraform y le habla por SSM (sin SSH).
 #
 # Perillas (variables de entorno):
-#   ESCALONES  RPS de cada escalón       (default "30 60 90 110 130")
-#   DURACION   cuánto dura cada escalón  (default 120s)
+#   ESCALONES  RPS de cada escalón       (default "30 60 90 130 200")
+#   DURACION   cuánto dura cada escalón  (default 60s)
 #
 # Referencia (campaña del 2026-11-02, 2 motores c7i.large): ~70 RPS dentro del
-# SLO; a 100 el P99 ronda 110ms; desde 130 empieza el quiebre. Después del
+# SLO; a 100 el P99 ronda 110ms; desde 130 empieza el quiebre y a 200, con 2
+# motores, colapsa (lo que se arregla sumando motor-3, ver computo.tf). Después del
 # último escalón la carga se queda en ese valor hasta que se la pare.
 #
 # Las tarjetas del loadgen son una por transacción: no tocan las tarjetas de
 # los celulares, solo comparten la CPU de los motores.
 set -euo pipefail
 
-ESCALONES="${ESCALONES:-30 60 90 110 130}"
-DURACION="${DURACION:-120s}"
+ESCALONES="${ESCALONES:-30 60 90 130 200}"
+DURACION="${DURACION:-60s}"
 
 cd "$(dirname "$0")/../infra/entornos/fase2"
 BORDE=$(terraform output -json instancias 2>/dev/null | jq -r '.borde // empty' 2>/dev/null || true)

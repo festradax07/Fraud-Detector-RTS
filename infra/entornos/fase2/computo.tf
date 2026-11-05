@@ -7,6 +7,9 @@ locals {
     borde   = { rol = "borde", tipo = var.tipo_caliente, subred = "borde", disco = 20 }
     motor-1 = { rol = "motor", tipo = var.tipo_caliente, subred = "aplicacion", disco = 20 }
     motor-2 = { rol = "motor", tipo = var.tipo_caliente, subred = "aplicacion", disco = 20 }
+    # Escalado manual en vivo (demo): descomentar y terraform apply suma una
+    # réplica detrás del ALB en ~5 minutos.
+    motor-3 = { rol = "motor", tipo = var.tipo_caliente, subred = "aplicacion", disco = 20 }
     datos   = { rol = "datos", tipo = var.tipo_caliente, subred = "datos", disco = 20 }
     frio    = { rol = "frio", tipo = var.tipo_frio, subred = "observabilidad", disco = 30 }
   }
